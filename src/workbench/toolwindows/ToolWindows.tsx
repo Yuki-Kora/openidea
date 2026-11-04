@@ -24,6 +24,8 @@ import { useContributions, type ToolWindowAnchor, type ToolWindowContribution } 
 import { useDistractionFree } from "../distractionFree";
 import {
   hideToolWindow,
+  hideUnpinnedToolWindows,
+  isToolWindowPinned,
   MAX_SPLIT,
   MIN_SPLIT,
   moveToolWindow,
@@ -37,6 +39,7 @@ import {
   SLOTS,
   slotOf,
   toggleMaximizeToolWindow,
+  toggleToolWindowPinned,
   toggleToolWindow,
   useToolWindowLayout,
   type SlotRecord,
@@ -116,6 +119,7 @@ function stripeButtonMenu(tw: ToolWindowContribution, showNames: boolean): MenuI
     { label: "Hide", run: () => removeFromStripe(tw.id) },
     { kind: "separator" },
     moveToMenu(tw),
+    { label: isToolWindowPinned(tw.id) ? "Unpin" : "Pin", checked: isToolWindowPinned(tw.id), run: () => toggleToolWindowPinned(tw.id) },
     { kind: "separator" },
     {
       label: "Show Tool Window Names",
@@ -635,6 +639,7 @@ function HeaderRow({
     ...own,
     ...(own.length ? [{ kind: "separator" } as MenuItem] : []),
     moveToMenu(tw),
+    { label: isToolWindowPinned(tw.id) ? "Unpin" : "Pin", checked: isToolWindowPinned(tw.id), run: () => toggleToolWindowPinned(tw.id) },
     {
       label: maximized ? "Restore Size" : "Maximize",
       icon: maximized ? "minimize" : "maximize",
@@ -1104,7 +1109,7 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
       <div ref={gridRef} className={clsx(styles.grid, widescreen && styles.widescreen)}>
         <SidePanel anchor="left" windows={windows} visible={visible} />
         {gap("left")}
-        <div ref={editorRef} className={clsx(styles.island, styles.editorIsland)}>
+        <div ref={editorRef} className={clsx(styles.island, styles.editorIsland)} onPointerDown={hideUnpinnedToolWindows}>
           {editor}
         </div>
         {gap("right")}

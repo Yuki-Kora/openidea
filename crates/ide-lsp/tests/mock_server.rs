@@ -1935,6 +1935,29 @@ async fn virtual_locations_and_text_document_content() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn csharp_metadata_and_generated_documents() {
+    let h = harness_for("csharp", "cs", &[("csharp-ls", incremental_caps())], &[]);
+    let (doc, _) = h.open("App.cs", "class App : Base {}\n");
+    h.wait_status("csharp-ls", ServerStatus::Ready).await;
+    let s = h.launcher.state("csharp-ls");
+    assert_eq!(s.requested("initialize")[0]["capabilities"]["experimental"]["csharp"]["metadataUris"], true);
+    for (uri, decompiled) in [
+        ("csharp:/C:/project/App.csproj/decompiled/Example.Base.cs", true),
+        ("csharp:/C:/project/App.csproj/generated/Generated.g.cs", false),
+    ] {
+        s.respond("textDocument/definition", json!([{ "uri": uri, "range": { "start": { "line": 0, "character": 6 }, "end": { "line": 0, "character": 10 } } }]));
+        let defs = h.mgr.goto(doc, Pos::new(0, 12), GotoKind::Definition).await.unwrap();
+        assert_eq!(defs[0].uri.as_deref(), Some(uri));
+        s.respond("csharp/metadata", json!({"source":"class Base {}\n", "assemblyName":"Example"}));
+        let vd = h.mgr.virtual_document(uri).await.unwrap();
+        assert_eq!(vd.text, "class Base {}\n");
+        assert_eq!(vd.language_id.as_str(), "csharp");
+        assert_eq!(vd.decompiled, decompiled);
+        assert_eq!(s.requested("csharp/metadata").last().unwrap(), &json!({"textDocument":{"uri":uri}}));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn jdt_class_file_contents() {
     let h = harness_for("java", "java", &[("jdtls", incremental_caps())], &[]);
     let (doc, _) = h.open("App.java", "import org.example.Lib;\n");

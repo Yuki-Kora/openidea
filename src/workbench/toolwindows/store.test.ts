@@ -8,6 +8,8 @@ import {
   hideActiveToolWindow,
   hideAllToolWindows,
   hideToolWindow,
+  hideUnpinnedToolWindows,
+  isToolWindowPinned,
   hasStripeButton,
   removeFromStripe,
   anchorOf,
@@ -27,6 +29,7 @@ import {
   setToolWindowSize,
   showToolWindow,
   toggleToolWindow,
+  toggleToolWindowPinned,
   toolWindowServiceImpl,
   useToolWindowLayout,
 } from "./store";
@@ -98,6 +101,30 @@ describe("tool window semantics", () => {
     expect(isToolWindowVisible("project")).toBe(true);
   });
 
+  it("auto-hides only unpinned windows on editor activation and persists pin state", () => {
+    disposers.push(registerToolWindow({ id: "database", title: "Database", icon: "database", anchor: "right", component: Empty }));
+    disposers.push(registerToolWindow({ id: "reader", title: "W-Reader", icon: "book", anchor: "right", secondary: true, component: Empty }));
+    showToolWindow("database");
+    showToolWindow("reader");
+    toggleToolWindowPinned("reader");
+    expect(isToolWindowPinned("reader")).toBe(false);
+    hideUnpinnedToolWindows();
+    expect(isToolWindowVisible("database")).toBe(true);
+    expect(isToolWindowVisible("reader")).toBe(false);
+    showToolWindow("reader");
+    loadToolWindowLayout("/work/a");
+    expect(isToolWindowPinned("reader")).toBe(false);
+  });
+
+  it("Hide All restores pinned and unpinned visibility without changing pin state", () => {
+    showToolWindow("terminal");
+    toggleToolWindowPinned("terminal");
+    hideAllToolWindows();
+    hideAllToolWindows();
+    expect(isToolWindowVisible("terminal")).toBe(true);
+    expect(isToolWindowPinned("terminal")).toBe(false);
+  });
+
   it("restores the maximized side through the shared Hide All toggle", () => {
     showToolWindow("terminal");
     toggleMaximizeToolWindow("terminal");
@@ -140,6 +167,14 @@ describe("tool window semantics", () => {
 });
 
 describe("tool window persistence", () => {
+  it("treats older layouts and snapshots without pin state as pinned", async () => {
+    localStorage.setItem("openidea.layout.v1:/work/a", JSON.stringify({ v: 2, visible: { right: "database" } }));
+    loadToolWindowLayout("/work/a");
+    expect(isToolWindowPinned("database")).toBe(true);
+    const { sanitizeLayoutSnapshot } = await import("./store");
+    expect(sanitizeLayoutSnapshot({ visible: { right: "database" } }).unpinned).toEqual({});
+  });
+
   it("persists visible windows and sizes per project root", () => {
     showToolWindow("structure");
     showToolWindow("terminal");

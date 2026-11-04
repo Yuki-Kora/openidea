@@ -6,6 +6,8 @@
  */
 import type { Text } from "@codemirror/state";
 import { call, commands, isTauri, onIdeEvent, type BlameLine } from "@/platform/ipc";
+import { perforceBlame } from "@/platform/perforceBlame";
+import { useProjectVcs } from "@/platform/projectVcs";
 
 export interface AuthorSummary {
   author: string;
@@ -55,6 +57,7 @@ export function clearBlameCache() {
   cache.clear();
   listeners.forEach((l) => l());
 }
+useProjectVcs.subscribe(clearBlameCache);
 
 function watchVcs() {
   if (!offVcs && isTauri()) offVcs = onIdeEvent("vcsChanged", clearBlameCache);
@@ -76,7 +79,10 @@ export function blameFor(path: string, text: Text): Promise<BlameLine[] | null> 
   const hit = cache.get(path);
   if (hit && (hit.text === text || hit.text === null)) return hit.lines;
   const entry: Entry = { text, lines: Promise.resolve(null) };
-  entry.lines = call(commands.vcsBlame(path, null, null)).then(
+  const provider = useProjectVcs.getState().provider;
+  entry.lines = (provider === "git" ? call(commands.vcsBlame(path, null, null))
+    : provider === "perforce" ? perforceBlame(path, text.toString())
+    : Promise.resolve(null)).then(
     (lines) => lines,
     () => {
       entry.text = null;

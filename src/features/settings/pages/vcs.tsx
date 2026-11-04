@@ -8,7 +8,8 @@ import { useEffect, useId, useState } from "react";
 import { call, commands, isTauri } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 import { WORKFLOW_LIMITS, type IssueLinkValid } from "@/platform/workflowSettings";
-import { Button, Icon, Input, type SelectOption, T } from "@/ui";
+import { Button, Icon, Input, Select, type SelectOption, T } from "@/ui";
+import { setProjectVcs, useProjectVcs, type VcsChoice } from "@/platform/projectVcs";
 import { Row, SettingSelect } from "../components/Form";
 import { useSetting } from "../components/context";
 import type { PageSpec } from "./spec";
@@ -35,6 +36,7 @@ function HistoryLimitRow() {
 
 function MappingsTable() {
   const project = useProject((s) => s.project);
+  const { choice, provider } = useProjectVcs();
   return (
     <div className={styles.tableBox}>
       <table className={styles.table} aria-label={tx("Directory mappings")}>
@@ -61,7 +63,10 @@ function MappingsTable() {
                 <Icon name="folder" size={16} className={styles.mappingIcon} />
                 {tx("<Project>")} {project.root}
               </td>
-              <td>{project.isGit ? "Git" : tx("<none>")}</td>
+              <td><Select<VcsChoice> aria-label={tx("VCS")} value={choice} onChange={setProjectVcs} options={[
+                { value: "auto", label: "Auto" }, { value: "git", label: "Git" },
+                { value: "perforce", label: "Perforce" }, { value: "none", label: "None" },
+              ]} />{choice === "auto" && <span role="status"> {provider === "ambiguous" ? "Git + Perforce: please select one" : provider}</span>}</td>
             </tr>
           )}
         </tbody>

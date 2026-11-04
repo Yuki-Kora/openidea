@@ -8,6 +8,7 @@ import { IconButton, Popup } from "@/ui";
 import { editorHunks, gotoChange, setHunkPopupHooks, type EditorHunk } from "./gutter";
 import styles from "./HunkPopup.module.css";
 import { tx } from "@/platform/i18n";
+import { repoOf } from "./store";
 
 interface PopupState {
   view: EditorView;
@@ -127,7 +128,7 @@ function HunkPopupView({ state }: { state: PopupState }) {
           onClick={() => step(1)}
         />
         <IconButton icon="undo" title="Rollback" size="small" data-autofocus onClick={rollback} />
-        <IconButton
+        {hunk.source !== "perforce" && repoOf(path) && <IconButton
           icon="diff"
           title="Show Diff"
           size="small"
@@ -135,7 +136,7 @@ function HunkPopupView({ state }: { state: PopupState }) {
             closeHunkPopup();
             void executeAction("vcs.showDiff", { path, line: hunk.start });
           }}
-        />
+        />}
         <IconButton
           icon={copied ? "check" : "copy"}
           title="Copy Original Text"

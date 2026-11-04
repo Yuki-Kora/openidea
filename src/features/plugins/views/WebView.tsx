@@ -23,6 +23,7 @@ import { pluginsBackend, type FileFilter } from "../backend";
 import { errorText, usePlugins } from "../store";
 import { FRAME_TAG, frameTheme, frameThemeMessage } from "./frame";
 import { onViewMessage } from "./viewStore";
+import { viewMemory } from "./viewMemory";
 import styles from "./PluginView.module.css";
 
 /** One change of a document, in UTF-16 offsets of the text it applies to. */
@@ -147,6 +148,19 @@ export function WebView({ pluginId, view, label, document = null, doc = null }: 
   const theme = useSyncExternalStore(subscribeTheme, themeKey, () => "");
   useEffect(postTheme, [theme, postTheme]);
 
+  // An iframe inside a hidden tool window can retain its viewport dimensions
+  // even though Chromium resets its scroll position. Report actual visibility.
+  useEffect(() => {
+    const element = frame.current;
+    if (!element || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (entry) post({ viewVisible: entry.isIntersecting && entry.intersectionRect.width > 0 && entry.intersectionRect.height > 0 });
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [page, post]);
+
   // The document's changes made elsewhere.
   useEffect(() => document?.subscribe((state) => post({ document: state })), [document, post]);
 
@@ -154,6 +168,11 @@ export function WebView({ pluginId, view, label, document = null, doc = null }: 
     let dialog = false;
     const run = async (op: string, args: Record<string, unknown>): Promise<[unknown, Transferable[]?]> => {
       switch (op) {
+        case "memory.get":
+          return [await viewMemory(pluginId, view, args.slot)];
+        case "memory.set":
+          if (typeof args.value !== "string") throw new Error("storage value must be a string");
+          return [await viewMemory(pluginId, view, args.slot, args.value)];
         case "document.get": {
           if (!document) throw new Error("this view shows no document");
           return [document.read()];

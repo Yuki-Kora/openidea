@@ -456,6 +456,14 @@ export const commands = {
 	lspExecuteCodeAction: (request: RequestId, doc: DocId, action: CodeAction, answers: FormAnswer[]) => typedError<IpcPath[], IdeError>(__TAURI_INVOKE("lsp_execute_code_action", { request, doc, action, answers })),
 	/**  Changes of every repository of the project. */
 	vcsStatus: () => typedError<FileStatus[], IdeError>(__TAURI_INVOKE("vcs_status")),
+	p4Info: () => typedError<P4Info, IdeError>(__TAURI_INVOKE("p4_info")),
+	p4Opened: () => typedError<P4Opened[], IdeError>(__TAURI_INVOKE("p4_opened")),
+	p4Diff: (path: string) => typedError<string, IdeError>(__TAURI_INVOKE("p4_diff", { path })),
+	/**  Compare the exact workspace #have revision with the editor buffer, never disk. */
+	p4LineHunks: (path: string, text: string) => typedError<LineHunk[], IdeError>(__TAURI_INVOKE("p4_line_hunks", { path, text })),
+	p4Blame: (path: string, text: string) => typedError<P4Blame, IdeError>(__TAURI_INVOKE("p4_blame", { path, text })),
+	p4Edit: (path: string) => typedError<null, IdeError>(__TAURI_INVOKE("p4_edit", { path })),
+	p4Submit: (paths: string[], description: string) => typedError<string, IdeError>(__TAURI_INVOKE("p4_submit", { paths, description })),
 	/**  The project's repositories, the primary one first. */
 	vcsRoots: () => typedError<VcsRoot[], IdeError>(__TAURI_INVOKE("vcs_roots")),
 	vcsBranchInfo: (repo: string | null) => typedError<BranchInfo, IdeError>(__TAURI_INVOKE("vcs_branch_info", { repo })),
@@ -5016,6 +5024,31 @@ export type OutlineItem = {
 export type OutputChunk = { kind: "stdout"; text: string } | { kind: "stderr"; text: string } | 
 /**  System message from the IDE (command line echo, exit code). */
 { kind: "system"; text: string };
+
+export type P4Annotation = {
+	change: string,
+	user: string,
+	time: string,
+};
+
+export type P4Blame = {
+	lines: P4Annotation[],
+	hunks: LineHunk[],
+};
+
+export type P4Info = {
+	client: string,
+	user: string,
+	root: string,
+	server: string,
+};
+
+export type P4Opened = {
+	path: string,
+	depot: string,
+	action: string,
+	change: string,
+};
 
 /**  A file of a partial commit: which of its changes against HEAD to commit. */
 export type PartialCommitFile = {

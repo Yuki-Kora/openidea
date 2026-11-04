@@ -7,16 +7,21 @@
 import { RangeSet, StateEffect, StateField, type EditorState, type Extension, type Text } from "@codemirror/state";
 import { EditorView, GutterMarker, ViewPlugin, type PluginValue, type ViewUpdate } from "@codemirror/view";
 import { foldState, foldedRanges } from "@codemirror/language";
+import { invoke } from "@tauri-apps/api/core";
 import type { HunkKind, LineHunk } from "@/bindings";
 import { call, commands, isTauri } from "@/platform/ipc";
 import { LaneMarker, gutterLaneMarkers, scrollbarMarks, type EditorDocContext, type ScrollbarMark } from "@/editor/api";
 import { lineStarts } from "./hunks";
 import { useVcs } from "./store";
+import { clearPerforceEditorStatus, setPerforceEditorStatus } from "./perforceDecorations";
+import { useProjectVcs } from "@/platform/projectVcs";
+import { clearGitBufferStatus, setGitBufferStatus } from "./gitBufferDecorations";
 
 /** A hunk with its current extent as document offsets (mapped through edits). */
 export interface EditorHunk extends LineHunk {
   from: number;
   to: number;
+  source?: "git" | "perforce";
 }
 
 export const setHunksEffect = StateEffect.define<LineHunk[]>();
@@ -158,6 +163,7 @@ class HunkFetcher implements PluginValue {
   private dirtySince = 0;
   private destroyed = false;
   private readonly unsub: () => void;
+  private readonly unsubProvider: () => void;
 
   constructor(
     private readonly view: EditorView,
@@ -166,6 +172,14 @@ class HunkFetcher implements PluginValue {
     this.schedule(30);
     this.unsub = useVcs.subscribe((s, prev) => {
       if (s.version !== prev.version || s.available !== prev.available) this.schedule(60);
+    });
+    this.unsubProvider = useProjectVcs.subscribe(() => {
+      this.dirtySince = ++this.seq;
+      popupHooks?.docChanged(this.view);
+      clearPerforceEditorStatus(this);
+      clearGitBufferStatus(this);
+      if (editorHunks(this.view.state).length) this.view.dispatch({ effects: setHunksEffect.of([]) });
+      this.schedule(30);
     });
   }
 
@@ -184,26 +198,50 @@ class HunkFetcher implements PluginValue {
 
   async fetch() {
     if (this.destroyed) return;
-    if (!useVcs.getState().available || !isTauri()) {
+    if (!isTauri()) {
       if (editorHunks(this.view.state).length) this.view.dispatch({ effects: setHunksEffect.of([]) });
       return;
     }
     const ticket = ++this.seq;
+    const provider = useProjectVcs.getState().provider;
+    if (provider !== "git" && provider !== "perforce") {
+      clearPerforceEditorStatus(this);
+      clearGitBufferStatus(this);
+      if (editorHunks(this.view.state).length) this.view.dispatch({ effects: setHunksEffect.of([]) });
+      return;
+    }
     try {
-      const hunks = await call(commands.vcsLineHunks(this.path));
+      const source = provider;
+      const hunks = provider === "git"
+        ? await call(commands.vcsLineHunks(this.path))
+        : await invoke<LineHunk[]>("p4_line_hunks", { path: this.path, text: this.view.state.doc.toString() });
       if (this.destroyed) return;
       // The buffer changed while the request was in flight; a fresh request is scheduled.
       if (this.dirtySince > ticket) return;
-      this.view.dispatch({ effects: setHunksEffect.of(hunks) });
+      if (source === "perforce") {
+        clearGitBufferStatus(this);
+        setPerforceEditorStatus(this, this.path, hunks.length > 0);
+      } else {
+        clearPerforceEditorStatus(this);
+        setGitBufferStatus(this, this.path, hunks.length > 0);
+      }
+      this.view.dispatch({ effects: setHunksEffect.of(hunks.map((h) => ({ ...h, source }))) });
     } catch {
       // Paths outside the repository etc.: no markers.
+      if (!this.destroyed && this.dirtySince <= ticket) clearPerforceEditorStatus(this);
+      if (!this.destroyed && this.dirtySince <= ticket) clearGitBufferStatus(this);
+      if (!this.destroyed && this.dirtySince <= ticket && editorHunks(this.view.state).length)
+        this.view.dispatch({ effects: setHunksEffect.of([]) });
     }
   }
 
   destroy() {
     this.destroyed = true;
+    clearPerforceEditorStatus(this);
+    clearGitBufferStatus(this);
     clearTimeout(this.timer);
     this.unsub();
+    this.unsubProvider();
   }
 }
 

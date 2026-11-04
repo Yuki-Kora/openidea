@@ -390,10 +390,10 @@ export function registerVcsActions(): () => void {
     },
     {
       id: "vcs.annotate",
-      title: "Annotate with Git Blame",
+      title: "Annotate with Version Control",
       category: "Git",
       icon: "history",
-      when: VCS,
+      when: "projectOpen",
       keywords: ["blame", "annotations"],
       toggled: () => {
         const ed = activeEditor();

@@ -30,6 +30,7 @@ pub mod java;
 pub mod lsp;
 pub mod nav;
 pub mod notebook;
+pub mod p4;
 pub mod perf;
 pub mod plugin;
 pub mod profiler;
@@ -239,6 +240,13 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         lsp::lsp_resolve_command,
         lsp::lsp_execute_code_action,
         vcs::vcs_status,
+        p4::p4_info,
+        p4::p4_opened,
+        p4::p4_diff,
+        p4::p4_line_hunks,
+        p4::p4_blame,
+        p4::p4_edit,
+        p4::p4_submit,
         vcs::vcs_roots,
         vcs::vcs_branch_info,
         vcs::vcs_line_hunks,

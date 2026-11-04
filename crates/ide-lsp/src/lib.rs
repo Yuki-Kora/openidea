@@ -741,6 +741,9 @@ impl LspManager {
         if server.name == "gopls" {
             params["capabilities"]["experimental"]["interactiveResolve"] = json!({ "inputTypes": ["string"] });
         }
+        if server.name == "csharp-ls" {
+            params["capabilities"]["experimental"]["csharp"] = json!({ "metadataUris": true });
+        }
         if !init_options.is_null() {
             params["initializationOptions"] = init_options;
         }
@@ -2276,7 +2279,8 @@ impl LspManager {
 
     /// Contents of a virtual document, from the server that owns `uri`:
     /// `workspace/textDocumentContent` (LSP 3.18) when the server serves the
-    /// scheme, jdtls' `java/classFileContents` for `jdt:` URIs. A `jar:` entry
+    /// scheme, jdtls' `java/classFileContents` for `jdt:` URIs, or
+    /// csharp-ls' `csharp/metadata` for `csharp:` URIs. A `jar:` entry
     /// is read from its archive, a `jar:` class shown as its library source
     /// (see [`library_source`]) or else decompiled by the server. Cached.
     pub async fn virtual_document(&self, uri: &str) -> IdeResult<VirtualDocument> {
@@ -2324,6 +2328,16 @@ impl LspManager {
                 )
                 .await
                 .map(|v| v.and_then(|v| v.get("text").and_then(Value::as_str).map(str::to_owned)))
+            } else if scheme == "csharp" && t.server.name == "csharp-ls" {
+                self.call::<_, Option<Value>>(
+                    t,
+                    "csharp/metadata",
+                    json!({ "textDocument": { "uri": uri } }),
+                    None,
+                    LONG_TIMEOUT,
+                )
+                .await
+                .map(|v| v.and_then(|v| v.get("source").and_then(Value::as_str).map(str::to_owned)))
             } else if class_file && languages.iter().any(|l| l.as_str() == "java") {
                 self.call::<_, Option<String>>(t, "java/classFileContents", json!({ "uri": uri }), None, LONG_TIMEOUT)
                     .await
@@ -2377,7 +2391,8 @@ impl LspManager {
         languages: &[LanguageId],
         server: Option<ide_core::ServerId>,
     ) -> VirtualDocument {
-        let decompiled = virtual_doc::is_decompiled(&text);
+        let decompiled = virtual_doc::is_decompiled(&text)
+            || (virtual_doc::scheme(uri) == "csharp" && uri.contains("/decompiled/"));
         let title = title.unwrap_or_else(|| virtual_doc::title(uri, decompiled));
         let detected = self.languages.detect(Path::new(&title), None);
         let language_id = if detected == LanguageId::plain_text() {

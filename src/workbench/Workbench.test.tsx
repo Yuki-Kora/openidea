@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { useState } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { emitLocalIdeEvent } from "@/platform/ipc";
 import { registerStatusItem, registerToolWindow, type StatusItemContribution } from "./contributions";
@@ -321,6 +322,46 @@ describe("tool window split areas", () => {
     expect(container.querySelector('[data-slot="left-split"]')).not.toHaveAttribute("hidden");
     unmount();
     disposers.forEach((d) => d());
+  });
+
+  it("keeps a pinned right window open while an unpinned split window auto-hides on editor activation", async () => {
+    const Reader = () => {
+      const [page, setPage] = useState(1);
+      return <button onClick={() => setPage((n) => n + 1)}>Book page {page}</button>;
+    };
+    const disposers = [
+      registerToolWindow({ id: "database", title: "Database", icon: "db", anchor: "right", requiresProject: false, component: () => <div>Database panel</div> }),
+      registerToolWindow({ id: "wreader", title: "W-Reader", icon: "book", anchor: "right", secondary: true, requiresProject: false, component: Reader }),
+    ];
+    loadToolWindowLayout("/right-unpin");
+    const editorClick = vi.fn();
+    const { container, unmount } = render(<ToolWindowLayout editor={<button onClick={editorClick}>Editor</button>} />);
+    try {
+      act(() => { showToolWindow("database"); showToolWindow("wreader"); });
+      expect(screen.getByText("Database panel")).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Book page 1" }));
+      expect(screen.getByRole("button", { name: "Book page 2" })).toBeVisible();
+
+      const reader = container.querySelector('[data-toolwindow="wreader"]')!;
+      fireEvent.click(reader.querySelector('button[aria-label="Options"]')!);
+      expect(reader.querySelector('button[aria-label="Options"]')).toHaveAttribute("aria-expanded", "true");
+      fireEvent.click(await screen.findByText("Unpin"));
+      expect(reader).toBeVisible();
+
+      const editorButton = screen.getByRole("button", { name: "Editor" });
+      fireEvent.pointerDown(editorButton);
+      fireEvent.click(editorButton);
+      expect(editorClick).toHaveBeenCalledOnce();
+      expect(screen.getByText("Database panel")).toBeVisible();
+      expect(reader).not.toBeVisible();
+
+      act(() => showToolWindow("wreader"));
+      expect(reader).toBeVisible();
+      expect(screen.getByRole("button", { name: "Book page 2" })).toBeVisible();
+    } finally {
+      unmount();
+      disposers.forEach((dispose) => dispose());
+    }
   });
 });
 

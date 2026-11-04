@@ -8,6 +8,7 @@ const JDT =
 describe("virtual document URIs", () => {
   it("tells URIs from file paths", () => {
     expect(isVirtualUri(JDT)).toBe(true);
+    expect(isVirtualUri("csharp:/C:/project/App.csproj/decompiled/Example.Base.cs")).toBe(true);
     expect(isVirtualUri("untitled:Untitled-1")).toBe(true);
     expect(isVirtualUri("/Users/me/a.java")).toBe(false);
     expect(isVirtualUri("C:\\src\\a.java")).toBe(false);

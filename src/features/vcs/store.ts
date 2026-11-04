@@ -14,6 +14,7 @@ import type { Branch, BranchInfo, FileStatus, Stash } from "@/bindings";
 import { call, commands, isTauri, onIdeEvent } from "@/platform/ipc";
 import { setContext } from "@/platform/context";
 import { useProject } from "@/platform/project";
+import { useProjectVcs } from "@/platform/projectVcs";
 import { setFileDecorations } from "@/workbench/contributions";
 import { effectiveKind, repoLabel, rootOf, statusDecorations, stripSlash } from "./model";
 
@@ -128,6 +129,7 @@ export function conflictedFiles(status: readonly FileStatus[] = useVcs.getState(
 }
 
 let timer: ReturnType<typeof setTimeout> | undefined;
+let epoch = 0;
 let inflight: Promise<void> | null = null;
 /** The refresh queued behind `inflight` (it may have started before the caller's change). */
 let followUp: Promise<void> | null = null;
@@ -165,6 +167,7 @@ export function refreshNow(): Promise<void> {
     return followUp;
   }
   inflight = (async () => {
+    const ticket = epoch;
     useVcs.setState({ loading: true });
     try {
       const s = useVcs.getState();
@@ -181,6 +184,7 @@ export function refreshNow(): Promise<void> {
         call(commands.vcsStatus()),
         scoped,
       ]);
+      if (ticket !== epoch) return;
       const roots = vcsRoots.map((r) => r.root);
       if ("error" in selected) {
         // The selected repository is gone (removed since the last scan): fall back to the primary one.
@@ -205,9 +209,9 @@ export function refreshNow(): Promise<void> {
         void refreshNow();
       }
     } catch (e) {
-      useVcs.setState({ error: e instanceof Error ? e.message : String(e) });
+      if (ticket === epoch) useVcs.setState({ error: e instanceof Error ? e.message : String(e) });
     } finally {
-      useVcs.setState((st) => ({ loading: false, version: st.version + 1 }));
+      if (ticket === epoch) useVcs.setState((st) => ({ loading: false, version: st.version + 1 }));
       inflight = null;
     }
   })();
@@ -225,16 +229,18 @@ export function applyStatus(status: FileStatus[], branch: BranchInfo | null) {
 }
 
 export async function loadBranches(): Promise<Branch[]> {
+  const ticket = epoch;
   const repo = currentRepo();
   const branches = await call(commands.vcsBranches(repo));
-  if (repo === currentRepo()) useVcs.setState({ branches, branchesLoaded: true });
+  if (ticket === epoch && repo === currentRepo()) useVcs.setState({ branches, branchesLoaded: true });
   return branches;
 }
 
 export async function loadStashes(): Promise<Stash[]> {
+  const ticket = epoch;
   const repo = currentRepo();
   const stashes = await call(commands.vcsStashes(repo));
-  if (repo === currentRepo()) useVcs.setState({ stashes, stashesLoaded: true });
+  if (ticket === epoch && repo === currentRepo()) useVcs.setState({ stashes, stashesLoaded: true });
   return stashes;
 }
 
@@ -244,10 +250,11 @@ export function statusOf(path: string): FileStatus | undefined {
 
 /** Repositories found below a project that is not itself under git (scanned in the background). */
 async function discoverRoots() {
+  if (useProjectVcs.getState().provider !== "git") return;
   const root = useVcs.getState().root;
   if (!root || !isTauri()) return;
   const roots = await call(commands.vcsRoots()).catch(() => []);
-  if (!roots.length || useVcs.getState().root !== root || useVcs.getState().available) return;
+  if (!roots.length || useProjectVcs.getState().provider !== "git" || useVcs.getState().root !== root || useVcs.getState().available) return;
   useVcs.setState({ available: true });
   setContext("vcsAvailable", true);
   void refreshNow();
@@ -257,9 +264,10 @@ async function discoverRoots() {
 export function installVcsStore(): () => void {
   const onProject = () => {
     const project = useProject.getState().project;
-    const available = !!project?.isGit;
+    const available = !!project && useProjectVcs.getState().root === project.root && useProjectVcs.getState().provider === "git";
     const root = project?.root ?? null;
     if (useVcs.getState().root === root && useVcs.getState().available === available) return;
+    epoch++;
     clearTimeout(timer);
     useVcs.setState({ ...initial, available, root, version: useVcs.getState().version + 1 });
     setContext("vcsAvailable", available);
@@ -271,6 +279,7 @@ export function installVcsStore(): () => void {
   const unsubProject = useProject.subscribe((s, prev) => {
     if (s.project !== prev.project) onProject();
   });
+  const unsubProvider = useProjectVcs.subscribe(onProject);
   const offVcs = onIdeEvent("vcsChanged", () => {
     if (useVcs.getState().available) scheduleRefresh(200);
     else void discoverRoots();
@@ -291,6 +300,7 @@ export function installVcsStore(): () => void {
     offSettings();
     clearTimeout(timer);
     unsubProject();
+    unsubProvider();
     offVcs();
     offFs();
     setContext("vcsAvailable", false);

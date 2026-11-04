@@ -6,6 +6,7 @@ import { addContributedFileTemplate, fileTemplates, isBuiltinFileTemplate } from
 import { createMemoryPluginsBackend, setPluginsBackend, webSchemeUrl } from "../backend";
 import { usePlugins } from "../store";
 import { FRAME_TAG, frameDocument } from "../views/frame";
+import * as memory from "../views/viewMemory";
 import {
   WebView,
   minimalChange,
@@ -174,6 +175,44 @@ describe("WebView", () => {
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
     expect(frame.getAttribute("src")).toBe("about:blank");
     expect(frame.getAttribute("allow")).toBeNull();
+  });
+
+  it("forwards tool window visibility changes to the frame", async () => {
+    let notify: IntersectionObserverCallback | undefined;
+    const disconnect = vi.fn();
+    vi.stubGlobal("IntersectionObserver", class {
+      constructor(callback: IntersectionObserverCallback) { notify = callback; }
+      observe() {}
+      disconnect = disconnect;
+    });
+    try {
+      const { view } = setup(false);
+      const { posted } = await frameOf(view.container);
+      await waitFor(() => expect(notify).toBeDefined());
+      const sendVisibility = (visible: boolean) => notify!([
+        { isIntersecting: visible, intersectionRect: { width: visible ? 100 : 0, height: visible ? 100 : 0 } } as IntersectionObserverEntry,
+      ], {} as IntersectionObserver);
+      sendVisibility(false);
+      sendVisibility(true);
+      expect(posted.slice(-2)).toEqual([
+        { tag: FRAME_TAG, viewVisible: false }, { tag: FRAME_TAG, viewVisible: true },
+      ]);
+      view.unmount();
+      expect(disconnect).toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("scopes storage requests to the receiving view", async () => {
+    const store = vi.spyOn(memory, "viewMemory").mockResolvedValue("saved");
+    try {
+      const { view } = setup(false);
+      const { posted, send } = await frameOf(view.container);
+      send({ call: -1, op: "memory.get", args: { slot: "state" } });
+      await waitFor(() => expect(posted.find((m) => m.reply === -1)).toMatchObject({ value: "saved" }));
+      expect(store).toHaveBeenCalledWith("acme.draw", "draw", "state");
+      send({ call: -2, op: "memory.set", args: { slot: "state", value: 12 } });
+      await waitFor(() => expect(posted.find((m) => m.reply === -2)).toMatchObject({ error: "storage value must be a string" }));
+    } finally { store.mockRestore(); }
   });
 
   it("serves the document to the page: versioned edits, replace, stale versions, outside changes", async () => {

@@ -730,7 +730,7 @@ export const useFileDecorations = create<FileDecorationsState>(() => ({
   subtrees: new Map(),
 }));
 
-const providerOrder = ["vcs", "problems"];
+const providerOrder = ["gitBuffer", "vcs", "perforce", "problems"];
 
 /** Replaces all decorations of one provider. */
 export function setFileDecorations(provider: string, decorations: Map<string, FileDecoration>) {

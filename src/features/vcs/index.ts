@@ -15,7 +15,6 @@ import {
   registerToolWindow,
 } from "@/workbench/contributions";
 import { executeAction } from "@/platform/actions";
-import { getContext } from "@/platform/context";
 import { lazyComponent } from "@/ui";
 import { registerVcsActions } from "./actions";
 import { installChangelists } from "./changelists";
@@ -228,6 +227,14 @@ export function activate(): () => void {
       component: lazyComponent(() => import("./GitLog").then((m) => m.GitToolWindow)),
       headerContent: lazyComponent(() => import("./GitLog").then((m) => m.GitTabs)),
     }),
+    registerToolWindow({
+      id: "perforce",
+      title: "Perforce",
+      icon: "toolwindow-changes",
+      anchor: "bottom",
+      order: 6,
+      component: lazyComponent(() => import("./PerforceView").then((m) => m.PerforceToolWindow)),
+    }),
     registerEditorKind({
       kind: DIFF_KIND,
       component: lazyComponent(() => import("./diff-editor-tab").then((m) => m.DiffEditorTab)),
@@ -256,11 +263,11 @@ export function activate(): () => void {
       menus: ["editorGutter"],
       order: 10,
       items: (_menu, { paths: [path] }) => {
-        if (!path || !getContext().vcsAvailable) return [];
+        if (!path) return [];
         const shown = editorsFor(path).some((h) => annotationsShown(h.view));
         return [
           {
-            label: shown ? "Close Annotations" : "Annotate with Git Blame",
+            label: shown ? "Close Annotations" : "Annotate with Version Control",
             run: () => void executeAction("vcs.annotate", path),
           },
         ];

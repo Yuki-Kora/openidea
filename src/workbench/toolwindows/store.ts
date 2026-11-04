@@ -91,6 +91,8 @@ export interface ToolWindowLayoutState {
   placements: Readonly<Record<string, ToolWindowPlacement>>;
   /** User choice of stripe buttons (opened → added, "Hide" → removed); persisted. */
   stripeButtons: Readonly<Record<string, boolean>>;
+  /** Windows explicitly set to auto-hide when the editor is activated. */
+  unpinned: Readonly<Record<string, boolean>>;
   /** Layout before Distraction Free Mode; restored on exit and persisted in place of `visible` meanwhile. */
   distractionFreeStash: SlotRecord | null;
 }
@@ -109,6 +111,7 @@ const initial = (): ToolWindowLayoutState => ({
   stashedMaximized: null,
   placements: {},
   stripeButtons: {},
+  unpinned: {},
   distractionFreeStash: null,
 });
 
@@ -195,7 +198,7 @@ export function resetToolWindowPlacements() {
     const tw = visible[slot] ? useContributions.getState().toolWindows.get(visible[slot]!) : undefined;
     if (tw && slotOf(tw) !== slot) visible[slot] = null;
   }
-  update({ placements: {}, stripeButtons: {}, visible });
+  update({ placements: {}, stripeButtons: {}, unpinned: {}, visible });
 }
 
 function storageKey(scope: string) {
@@ -220,6 +223,7 @@ function persist() {
     splits,
     placements,
     stripeButtons,
+    unpinned,
     distractionFreeStash,
   } = useToolWindowLayout.getState();
   // Distraction Free Mode is not saved: the layout to restore is.
@@ -227,7 +231,7 @@ function persist() {
   try {
     localStorage.setItem(
       storageKey(scope),
-      JSON.stringify({ v: LAYOUT_VERSION, visible, sizes, splits, placements, stripeButtons }),
+      JSON.stringify({ v: LAYOUT_VERSION, visible, sizes, splits, placements, stripeButtons, unpinned }),
     );
   } catch {
     /* storage unavailable */
@@ -341,6 +345,7 @@ export function loadToolWindowLayout(scope: string) {
     splits: sanitizeSplits(saved?.splits),
     placements,
     stripeButtons: sanitizeStripeButtons(saved?.stripeButtons),
+    unpinned: sanitizeStripeButtons(saved?.unpinned),
     mounted: new Set(Object.values(visible).filter((v): v is string => !!v)),
   });
   publishVisibility();
@@ -412,6 +417,24 @@ export function showToolWindow(id: string, focus = false) {
     maximized: s.maximized && s.maximized !== a ? null : s.maximized,
     focusRequest: focus ? { id, seq: ++focusSeq } : s.focusRequest,
   });
+}
+
+export function isToolWindowPinned(id: string): boolean {
+  return useToolWindowLayout.getState().unpinned[id] !== true;
+}
+
+export function toggleToolWindowPinned(id: string) {
+  const s = useToolWindowLayout.getState();
+  update({ unpinned: { ...s.unpinned, [id]: isToolWindowPinned(id) } });
+}
+
+/** Editor activation only closes explicitly unpinned windows. */
+export function hideUnpinnedToolWindows() {
+  const s = useToolWindowLayout.getState();
+  for (const slot of SLOTS) {
+    const id = s.visible[slot];
+    if (id && s.unpinned[id]) hideToolWindow(id);
+  }
 }
 
 export function hideToolWindow(id: string) {
@@ -584,6 +607,7 @@ export interface ToolWindowLayoutSnapshot {
   splits: Record<ToolWindowAnchor, number>;
   placements: Record<string, ToolWindowPlacement>;
   stripeButtons: Record<string, boolean>;
+  unpinned: Record<string, boolean>;
 }
 
 export function toolWindowLayoutSnapshot(): ToolWindowLayoutSnapshot {
@@ -594,6 +618,7 @@ export function toolWindowLayoutSnapshot(): ToolWindowLayoutSnapshot {
     splits: { ...s.splits },
     placements: { ...s.placements },
     stripeButtons: { ...s.stripeButtons },
+    unpinned: { ...s.unpinned },
   };
 }
 
@@ -606,6 +631,7 @@ export function sanitizeLayoutSnapshot(raw: unknown): ToolWindowLayoutSnapshot {
     splits: sanitizeSplits(r.splits),
     placements: sanitizePlacements(r.placements),
     stripeButtons: sanitizeStripeButtons(r.stripeButtons),
+    unpinned: sanitizeStripeButtons(r.unpinned),
   };
 }
 
@@ -629,6 +655,7 @@ export function applyToolWindowLayout(snapshot: ToolWindowLayoutSnapshot) {
     splits: { ...snapshot.splits },
     placements,
     stripeButtons: { ...snapshot.stripeButtons },
+    unpinned: { ...snapshot.unpinned },
     mounted,
     maximized: null,
     stashed: null,

@@ -4,6 +4,8 @@ import { EditorView, GutterMarker, ViewPlugin, gutter, type PluginValue, type Vi
 import type { BlameLine } from "@/bindings";
 import { executeAction } from "@/platform/actions";
 import { call, commands } from "@/platform/ipc";
+import { perforceBlame } from "@/platform/perforceBlame";
+import { useProjectVcs } from "@/platform/projectVcs";
 import { showContextMenu } from "@/ui";
 import { notifications } from "@/workbench/contributions";
 import { formatDate } from "./model";
@@ -92,12 +94,17 @@ class BlameRefresher implements PluginValue {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private destroyed = false;
   private readonly offHead: () => void;
+  private readonly offProvider: () => void;
   constructor(
     private readonly view: EditorView,
     private readonly path: string,
   ) {
     this.offHead = useVcs.subscribe((s, p) => {
       if (s.branch?.headCommit !== p.branch?.headCommit) this.schedule(100);
+    });
+    this.offProvider = useProjectVcs.subscribe(() => {
+      if (this.view.state.field(blameField, false)) this.view.dispatch({ effects: setBlame.of([]) });
+      this.schedule(0);
     });
   }
   update(u: ViewUpdate) {
@@ -106,9 +113,11 @@ class BlameRefresher implements PluginValue {
   private schedule(delay: number) {
     clearTimeout(this.timer);
     this.timer = setTimeout(() => {
-      void call(commands.vcsBlame(this.path, null, null))
+      const doc = this.view.state.doc;
+      const provider = useProjectVcs.getState();
+      void liveBlame(this.path, doc.toString())
         .then((lines) => {
-          if (!this.destroyed && this.view.state.field(blameField, false))
+          if (!this.destroyed && useProjectVcs.getState() === provider && this.view.state.doc === doc && this.view.state.field(blameField, false))
             this.view.dispatch({ effects: setBlame.of(lines) });
         })
         .catch(() => undefined);
@@ -117,6 +126,7 @@ class BlameRefresher implements PluginValue {
   destroy() {
     this.destroyed = true;
     this.offHead();
+    this.offProvider();
     clearTimeout(this.timer);
   }
 }
@@ -164,14 +174,14 @@ function blameExtension(lines: BlameLine[], path: string, live: boolean): Extens
         domEventHandlers: {
           click(view, block) {
             const l = lineAt(view, block.from);
-            if (l && !isUncommitted(l)) void executeAction("vcs.showCommit", l.commit);
+            if (l && !isUncommitted(l) && !l.commit.startsWith("p4:")) void executeAction("vcs.showCommit", l.commit);
             return true;
           },
           contextmenu(view, block, event) {
             const l = lineAt(view, block.from);
             event.preventDefault();
             showContextMenu(event as MouseEvent, [
-              ...(l && !isUncommitted(l)
+              ...(l && !isUncommitted(l) && !l.commit.startsWith("p4:")
                 ? [
                     {
                       label: "Show Commit in Git Log",
@@ -215,7 +225,12 @@ export async function toggleAnnotations(view: EditorView, path: string, text?: s
     return;
   }
   try {
-    const lines = await call(commands.vcsBlame(path, text ?? null, revision ?? null));
+    const doc = view.state.doc;
+    const provider = useProjectVcs.getState();
+    const lines = revision !== undefined || text !== undefined
+      ? await call(commands.vcsBlame(path, text ?? null, revision ?? null))
+      : await liveBlame(path, doc.toString());
+    if (view.state.doc !== doc || useProjectVcs.getState() !== provider) return;
     setAnnotations(view, lines, path, text === undefined);
   } catch (e) {
     notifications().notify({
@@ -225,4 +240,11 @@ export async function toggleAnnotations(view: EditorView, path: string, text?: s
       body: e instanceof Error ? e.message : String(e),
     });
   }
+}
+
+async function liveBlame(path: string, text: string): Promise<BlameLine[]> {
+  const provider = useProjectVcs.getState().provider;
+  if (provider === "git") return call(commands.vcsBlame(path, null, null));
+  if (provider === "perforce") return perforceBlame(path, text);
+  return [];
 }
