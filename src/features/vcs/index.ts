@@ -146,6 +146,18 @@ function conflictsBody(names: string[]): string {
 }
 
 /** Settings › Version Control › Log (also used by the Settings window). */
+export { activateComparisonWindow, ComparisonWindow } from "./ComparisonWindow";
+
+/** The diff viewer (editor kind `diff`), also for windows that show diffs without Git (deployment). */
+export function activateDiffViewer(): () => void {
+  return registerEditorKind({
+    kind: DIFF_KIND,
+    component: lazyComponent(() => import("./diff-editor-tab").then((m) => m.DiffEditorTab)),
+    title: (input) => diffTitle(input.data as DiffData),
+    icon: () => "diff",
+  });
+}
+
 export function activateSettingsPages(): () => void {
   return registerSettingsPage({
     id: "vcs.log",
@@ -235,12 +247,7 @@ export function activate(): () => void {
       order: 6,
       component: lazyComponent(() => import("./PerforceView").then((m) => m.PerforceToolWindow)),
     }),
-    registerEditorKind({
-      kind: DIFF_KIND,
-      component: lazyComponent(() => import("./diff-editor-tab").then((m) => m.DiffEditorTab)),
-      title: (input) => diffTitle(input.data as DiffData),
-      icon: () => "diff",
-    }),
+    activateDiffViewer(),
     registerEditorKind({
       kind: MERGE_KIND,
       component: lazyComponent(() => import("./MergeEditor").then((m) => m.MergeEditor)),

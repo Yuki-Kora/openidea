@@ -40,11 +40,14 @@ function PerforcePanel() {
     finally { setBusy(false); }
   }, []);
 
-  useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
-    if (!active) { setDiff(""); return; }
     let live = true;
-    setDiff(""); setDiffPath(null); setError("");
+    queueMicrotask(() => { if (live) void refresh(); });
+    return () => { live = false; };
+  }, [refresh]);
+  useEffect(() => {
+    if (!active) return;
+    let live = true;
     invoke<string>("p4_diff", { path: active }).then((value) => { if (live) { setDiff(value); setDiffPath(active); } })
       .catch((e) => { if (live) { setDiff(""); setDiffPath(null); setError(errorMessage(e)); } });
     return () => { live = false; };
