@@ -24,13 +24,14 @@ import { controlLabel, controlOperation, inProgress } from "./operations";
 import { annotationsShown, blameSlot } from "./blame";
 import { inlineBlame } from "./inlineBlame";
 import { BranchWidget, useBranchesPopup } from "./BranchWidget";
-import { showConflictsDialog } from "./conflictsUi";
+import { showConflictsDialog, takeContinueWhenResolved } from "./conflictsUi";
 import { registerCompareActions } from "./compare";
 import { DIFF_KIND, diffTitle, type DiffData } from "./diffInput";
 import { VcsDialogHost } from "./dialogs";
 import { changeMarkers } from "./gutter";
 import { installHunkPopup } from "./HunkPopup";
 import { LOCAL_HISTORY_KIND } from "./localHistoryKind";
+import { SELECTION_HISTORY_KIND, type SelectionHistoryData } from "./selectionHistoryKind";
 import { registerLocalHistoryActions } from "./localHistoryActions";
 import { MERGE_KIND, type MergeData } from "./mergeKind";
 import { registerMergeActions } from "./mergeActions";
@@ -42,7 +43,7 @@ import { activate as activateConflictMarkers } from "./conflictMarkers";
 import { MergeRebaseWidget } from "./MergeRebaseWidget";
 import { installFileConfirmations } from "./confirmations";
 import { installIncomingCheck } from "./incoming";
-import { installGitLog, selectGitTab, useGitLog } from "./logStore";
+import { closeLogTab, installGitLog, selectGitTab, useGitLog } from "./logStore";
 import { installVcsStore, onConflictsAppeared, onConflictsCleared, useVcs } from "./store";
 import { tx } from "@/platform/i18n";
 
@@ -152,6 +153,7 @@ export { activateComparisonWindow, ComparisonWindow } from "./ComparisonWindow";
 export function activateDiffViewer(): () => void {
   return registerEditorKind({
     kind: DIFF_KIND,
+    standalone: true,
     component: lazyComponent(() => import("./diff-editor-tab").then((m) => m.DiffEditorTab)),
     title: (input) => diffTitle(input.data as DiffData),
     icon: () => "diff",
@@ -183,8 +185,13 @@ export function activate(): () => void {
 
   onConflictsCleared(() => {
     notifications().expire?.("vcs.conflicts");
-    // As IDEA does once the last conflict is resolved: offer to continue the stopped operation.
     const op = inProgress();
+    // Resolved from the Conflicts dialog: the stopped rebase / cherry-pick goes on by itself.
+    if (op && takeContinueWhenResolved() === op) {
+      void controlOperation("continue", op);
+      return;
+    }
+    // Otherwise, as IDEA does once the last conflict is resolved: offer to continue it.
     if (op)
       notifications().notify({
         group: "vcs",
@@ -247,6 +254,34 @@ export function activate(): () => void {
       order: 6,
       component: lazyComponent(() => import("./PerforceView").then((m) => m.PerforceToolWindow)),
     }),
+    registerEditorKind({
+      kind: "git-revision",
+      standalone: true,
+      component: lazyComponent(() => import("./RevisionBrowser").then((m) => m.GitRevisionEditor)),
+      title: (input) => {
+        const data = input.data as { path: string; revision: string };
+        return `${baseName(data.path)} (${data.revision.slice(0, 8)})`;
+      },
+      icon: () => "file",
+      restorable: true,
+    }),
+    registerEditorKind({
+      kind: "git-log",
+      standalone: true,
+      component: lazyComponent(() => import("./LogScope").then((m) => m.GitLogEditor)),
+      title: (input) => (input.data as { label: string }).label,
+      icon: () => "toolwindow-git",
+      restorable: true,
+      onClose: (input) => closeLogTab((input.data as { id: string }).id),
+    }),
+    registerEditorKind({
+      kind: "git-merge-diff",
+      standalone: true,
+      component: lazyComponent(() => import("./GitMergeDiff").then((m) => m.GitMergeDiff)),
+      title: (input) => (input.data as { path: string }).path,
+      icon: () => "diff",
+       restorable: true,
+    }),
     activateDiffViewer(),
     registerEditorKind({
       kind: MERGE_KIND,
@@ -259,6 +294,15 @@ export function activate(): () => void {
       component: lazyComponent(() => import("./LocalHistory").then((m) => m.LocalHistoryEditor)),
       title: (input) => `Local History: ${baseName((input.data as { path: string }).path)}`,
       icon: () => "clock",
+    }),
+    registerEditorKind({
+      kind: SELECTION_HISTORY_KIND,
+      component: lazyComponent(() => import("./SelectionHistory").then((m) => m.SelectionHistoryEditor)),
+      title: (input) => {
+        const { path, lines } = input.data as SelectionHistoryData;
+        return `History: ${baseName(path)}:${lines[0] + 1}-${lines[1] + 1}`;
+      },
+      icon: () => "history",
     }),
     registerEditorContribution({
       id: "vcs.changeMarkers",

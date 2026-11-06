@@ -86,12 +86,19 @@ const BUILT_AT_RUNTIME = new Set<string>([]);
 const UNTRANSLATED = new Set<string>([
   "dotnet test",
   "netcoredbg (.NET)",
+  "php-debug (PHP)",
   // Product names
   "Cargo",
   "CMake",
   "Prettier",
   "oxfmt",
+  "Ruff",
   "IntelliJ IDEA",
+  "GitHub",
+  "PHPStan",
+  // Docker run target placeholder values
+  "compose.yaml",
+  "python:3.12",
   // Go environment variables and placeholder values
   "CGO",
   "GOPROXY",
@@ -108,6 +115,7 @@ const UNTRANSLATED = new Set<string>([
   "loopvar,rangefunc",
   // SSH and run-target placeholders
   "SSH",
+  "WSL",
   "example.com",
   "java",
   "node",
@@ -157,6 +165,7 @@ const UNTRANSLATED = new Set<string>([
   "Python",
   "npm",
   "OpenIDEA",
+  "Oracle",
   "Spring Boot",
   "PostgreSQL",
   "Pyrefly",

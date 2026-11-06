@@ -77,26 +77,89 @@ pub struct BlameLine {
     pub summary: String,
 }
 
+/// History for Selection: the commits that changed a block of lines, newest first.
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockHistory {
+    /// The selected lines in HEAD (0-based, inclusive); None when none of them is committed.
+    pub head_lines: Option<(u32, u32)>,
+    pub revisions: Vec<BlockRevision>,
+}
+
+/// A commit that changed the block, with the block in its first parent and in it.
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockRevision {
+    pub id: String,
+    pub short_id: String,
+    pub author: String,
+    pub email: String,
+    pub time_ms: f64,
+    pub summary: String,
+    /// Repository-relative path of the file in this commit (before a later rename).
+    pub path: String,
+    /// The block before the commit; empty when the commit added it.
+    pub before: String,
+    pub after: String,
+    /// 0-based first line of the block before and after the commit.
+    pub before_line: u32,
+    pub after_line: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Commit {
     pub id: String,
     pub short_id: String,
     pub parents: Vec<String>,
+    /// Connections in the filtered graph; never use these as revision/diff parents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_parents: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_dashed: Vec<bool>,
+    /// Repository-relative filename at this revision in rename-following history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_boundary_parents: Vec<String>,
+    /// Reachability from HEAD, computed independently of the visible filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_current_branch: Option<bool>,
     pub author: String,
     pub email: String,
+    #[serde(default)]
+    pub committer: String,
+    #[serde(default)]
+    pub committer_email: String,
     pub time_ms: f64,
     pub summary: String,
     pub message: String,
+    #[serde(default)]
+    pub message_truncated: bool,
     pub refs: Vec<String>,
     /// Committer time (Log › View Options › Commit Timestamp).
     #[serde(default)]
     pub commit_time_ms: f64,
-    /// Per parent, under a user or text filter: the link passes commits the filter hides
-    /// (`parents` then name the nearest shown ancestors). Empty when no parent is rewritten.
+    /// Legacy alias of `graph_dashed`, indexed by displayed parents.
     #[serde(default)]
     #[specta(optional)]
     pub dashed: Vec<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LogDetails {
+    pub message: String,
+    pub containing_branches: Vec<String>,
+    /// Git's verification code: G/U good, B bad, E error, N unsigned, X/Y expired, R revoked.
+    pub signature: String,
+    pub signer: String,
+    pub key: String,
+    pub fingerprint: String,
 }
 
 /// Order of the Git Log (Graph Options › Sort).
@@ -108,13 +171,29 @@ pub enum LogOrder {
     Topo,
     /// `--date-order`: commit time, but never a parent before its children.
     Date,
+    // Topological grouping with incoming merge parents visited before the main line.
+    Standard,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LogQuery {
+    #[serde(default)]
+    pub speed_search: Option<String>,
+    #[serde(default)]
+    pub search_fields: Vec<String>,
+    /// Jump directly to an indexed window containing this commit (50 rows of context).
+    #[serde(default)]
+    pub seek: Option<String>,
+    #[serde(default)]
+    pub retain_until: Option<String>,
     pub branch: Option<String>,
     pub path: Option<ide_core::IpcPath>,
+    #[serde(default)]
+    pub paths: Vec<ide_core::IpcPath>,
+    /// File history follows renames; structure filters retain fixed paths.
+    #[serde(default)]
+    pub follow: bool,
     pub author: Option<String>,
     pub text: Option<String>,
     pub skip: u32,
@@ -123,6 +202,9 @@ pub struct LogQuery {
     /// not the left). Takes precedence over `branch`.
     #[serde(default)]
     pub range: Option<String>,
+    /// Additional ranges unioned with each other and with selected branches.
+    #[serde(default)]
+    pub ranges: Vec<String>,
     /// `text` is a regular expression (Log filter `.*`).
     #[serde(default)]
     pub text_regex: bool,
@@ -135,6 +217,8 @@ pub struct LogQuery {
     /// More author needles next to `author`; a commit matches any of them (Log User filter).
     #[serde(default)]
     pub authors: Vec<String>,
+    #[serde(default)]
+    pub authors_exact: bool,
     #[serde(default)]
     pub order: LogOrder,
     /// Follow only the first parent of merges (`--first-parent`).
@@ -150,6 +234,13 @@ pub struct LogQuery {
     pub since_ms: Option<f64>,
     #[serde(default)]
     pub until_ms: Option<f64>,
+    #[serde(default)]
+    pub request: Option<ide_core::RequestId>,
+    #[serde(default)]
+    pub summary_only: bool,
+    /// Inclusive refresh boundary. Clients join only verified linear prefixes.
+    #[serde(default)]
+    pub stop_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -182,6 +273,12 @@ pub struct CommitOptions {
     /// entries of the index change; afterwards their index entries match the new commit.
     #[serde(default)]
     pub partial: Vec<PartialCommitFile>,
+    /// Files committed with their working-tree content, staged or not.
+    #[serde(default)]
+    pub stage: Vec<ide_core::IpcPath>,
+    /// Staged files left out of the commit; they stay staged afterwards.
+    #[serde(default)]
+    pub exclude: Vec<ide_core::IpcPath>,
 }
 
 /// A file of a partial commit: which of its changes against HEAD to commit.
@@ -209,6 +306,18 @@ pub struct ChangedFile {
     pub path: String,
     pub kind: ChangeKind,
     pub old_path: Option<String>,
+}
+
+/// Added and deleted lines of one file between two revisions (`git diff --numstat`).
+/// A rename keeps the counts of the content change; a pure rename is `0`/`0`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FileLineStats {
+    /// Path after the change (the only path, when the file was not renamed).
+    pub path: String,
+    pub old_path: Option<String>,
+    pub added: u32,
+    pub removed: u32,
 }
 
 /// A file changed across several commits: its content at `before` ↔ at `after`.
@@ -253,6 +362,27 @@ pub struct PushBranchOptions<'a> {
     pub remote: Option<&'a str>,
     /// `git push --force-with-lease`.
     pub force_with_lease: bool,
+    /// `git push --force` (Force push anyway after a rejected force-with-lease push).
+    pub force: bool,
+    /// Record the target as the branch's upstream even when it already has one.
+    pub set_upstream: bool,
+    /// Skip the pre-push hook (`--no-verify`).
+    pub no_verify: bool,
+}
+
+/// Options of [`Repo::push_with`]: the Push dialog's choices for the current branch.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PushOptions {
+    /// `git push --force-with-lease`.
+    pub force_with_lease: bool,
+    /// `git push --force` (Force push anyway after a rejected force-with-lease push).
+    pub force: bool,
+    /// Push to the branch's remote under the same name and record it as upstream.
+    pub set_upstream: bool,
+    /// Push tags too.
+    pub tags: Option<PushTags>,
+    /// Skip the pre-push hook (`--no-verify`).
+    pub no_verify: bool,
 }
 
 /// What an interactive rebase does with one commit.
@@ -377,6 +507,10 @@ pub enum CheckoutOutcome {
     LocalChanges {
         files: Vec<String>,
     },
+    /// These untracked files (repository-relative paths) would be overwritten.
+    UntrackedFiles {
+        files: Vec<String>,
+    },
     /// Local branch `local` has commits that remote branch `remote` does not.
     LocalBranchAhead {
         local: String,
@@ -387,6 +521,14 @@ pub enum CheckoutOutcome {
     Conflicts {
         files: Vec<String>,
     },
+}
+
+/// HEAD before and after a history rewrite, for its Undo.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadChange {
+    pub before: String,
+    pub after: String,
 }
 
 /// A deleted local branch, enough to restore it (IDEA's "Restore" notification action).
@@ -400,6 +542,15 @@ pub struct DeletedBranch {
     pub upstream: Option<String>,
     /// It was not fully merged: its own commits are now unreachable from any branch.
     pub unmerged: bool,
+}
+
+/// A deleted tag, enough to restore it (Restore in the tag-deleted notification).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedTag {
+    pub name: String,
+    /// What the tag pointed at: its tag object (annotated tags) or commit.
+    pub target: String,
 }
 
 /// Who stands on each side of the conflicts of the operation in progress (merge editor
@@ -458,7 +609,9 @@ pub struct ChangelistState {
     pub files: std::collections::BTreeMap<String, String>,
 }
 
+mod bek;
 mod blame;
+mod block_history;
 pub mod changelists;
 mod cli;
 mod compare;
@@ -466,9 +619,12 @@ mod diff;
 mod history;
 mod ignore;
 mod index_writes;
+mod log_index;
 mod manage;
 mod ops;
 mod patch;
+mod preserve;
+pub use ops::UNSTAGED_CHANGES_PREVENT_REBASE;
 mod refs;
 mod remotes;
 mod repo;
@@ -569,6 +725,8 @@ pub struct Repo {
     git_dir: PathBuf,
     inner: std::sync::Mutex<repo::Cache>,
     ignored: std::sync::RwLock<IgnoredNames>,
+    log_index: std::sync::Mutex<log_index::LogIndex>,
+    log_signatures: std::sync::Mutex<std::collections::HashMap<String, LogDetails>>,
 }
 
 impl Repo {
@@ -685,6 +843,20 @@ impl Repo {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         write::blame(self, path, current_text, revision, encoding)
     }
+    /// History for Selection: commits that changed `lines` (0-based, inclusive, of the
+    /// current text: `current_text`, or the file on disk), mapped to HEAD's lines first.
+    pub fn block_history(
+        &self,
+        path: &Path,
+        current_text: Option<&str>,
+        lines: (u32, u32),
+        encoding: impl Into<TextEncoding>,
+        cancel: &CancellationToken,
+    ) -> IdeResult<BlockHistory> {
+        let encoding = encoding.into();
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        block_history::block_history(self, path, current_text, lines, encoding, cancel)
+    }
     /// Commits newest-first in topological order (children before parents).
     ///
     /// `branch` is any revision; when absent, HEAD plus all local and remote branches are
@@ -694,7 +866,130 @@ impl Repo {
     /// `refs` decorations are `HEAD`, branch names (`main`, `origin/main`) and `tag: <name>`.
     pub fn log(&self, query: &LogQuery) -> IdeResult<Vec<Commit>> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
-        history::log(self, query)
+        history::log(self, query, &CancellationToken::new())
+    }
+    pub fn log_cancellable(&self, query: &LogQuery, cancel: &CancellationToken) -> IdeResult<Vec<Commit>> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        history::log(self, query, cancel)
+    }
+    /// Enables the disposable, content-addressed log cache outside the worktree.
+    pub fn enable_log_index(&self, cache_dir: &Path) {
+        let key = blake3::hash(self.git_dir.to_string_lossy().as_bytes()).to_hex().to_string();
+        self.log_index.lock().unwrap_or_else(|p| p.into_inner()).open(&cache_dir.join(key));
+    }
+    /// Reference names and peeled commit ids, including tags and detached HEAD.
+    pub fn log_refs(&self) -> IdeResult<std::collections::BTreeMap<String, String>> {
+        let repo = self.gix()?;
+        Ok(history::decorations(&repo)?
+            .into_iter()
+            .flat_map(|(id, names)| names.into_iter().map(move |name| (name, id.to_string())))
+            .collect())
+    }
+    pub fn log_users(&self) -> IdeResult<Vec<String>> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        let out = cli::run(self.root(), &["log", "--all", "--format=%an <%ae>"], None)?;
+        Ok(out
+            .stdout_str()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+    pub fn log_details(&self, revision: &str) -> IdeResult<LogDetails> {
+        self.log_details_cancellable(revision, &CancellationToken::new())
+    }
+    pub fn log_details_cancellable(&self, revision: &str, cancel: &CancellationToken) -> IdeResult<LogDetails> {
+        let allowed = self.execution_allowed.load(std::sync::atomic::Ordering::Acquire);
+        let _scope = crate::ExecutionScope::enter(allowed);
+        let repo = self.gix()?;
+        let object =
+            repo.find_object(repo::resolve(&repo, revision)?).map_err(repo::gx)?.peel_to_commit().map_err(repo::gx)?;
+        let commit_id = object.id;
+        let id = commit_id.to_string();
+        let contains = format!("--contains={id}");
+        let branches =
+            cli::run_cancellable(self.root(), &["branch", "-a", &contains, "--format=%(refname:short)"], cancel)?;
+        let cache_key = format!("{allowed}:{id}");
+        let cached = self.log_signatures.lock().unwrap_or_else(|p| p.into_inner()).get(&cache_key).cloned();
+        let mut details = if let Some(details) = cached {
+            details
+        } else {
+            let end = object.data.windows(2).position(|s| s == b"\n\n").unwrap_or(object.data.len());
+            let headers = &object.data[..end];
+            let signed = headers.windows(8).any(|s| s == b"\ngpgsig ") || headers.windows(8).any(|s| s == b"\ngpgsig-");
+            let output = if allowed && signed {
+                Some(cli::run_cancellable(
+                    self.root(),
+                    &["log", "-1", "--format=%G?%x00%GS%x00%GK%x00%GF", "--end-of-options", &id],
+                    cancel,
+                )?)
+            } else {
+                None
+            };
+            let text = output.as_ref().map(|out| out.stdout_str()).unwrap_or_default();
+            let fields: Vec<_> = text.trim_end().split('\0').collect();
+            let message = {
+                let mut index = self.log_index.lock().unwrap_or_else(|p| p.into_inner());
+                let message = index.message(&repo, commit_id)?;
+                index.flush();
+                message
+            };
+            let details = LogDetails {
+                message,
+                containing_branches: Vec::new(),
+                signature: if !signed {
+                    "N".into()
+                } else {
+                    fields.first().filter(|s| !s.is_empty()).unwrap_or(&"E").to_string()
+                },
+                signer: fields.get(1).unwrap_or(&"").to_string(),
+                key: fields.get(2).unwrap_or(&"").to_string(),
+                fingerprint: fields.get(3).unwrap_or(&"").to_string(),
+            };
+            self.log_signatures.lock().unwrap_or_else(|p| p.into_inner()).insert(cache_key, details.clone());
+            details
+        };
+        details.containing_branches =
+            branches.stdout_str().lines().filter(|s| !s.ends_with("/HEAD")).map(str::to_string).collect();
+        Ok(details)
+    }
+
+    /// Lists one immutable revision directory. Directory names end in `/`.
+    pub fn revision_children(&self, revision: &str, directory: &str) -> IdeResult<Vec<String>> {
+        let repo = self.gix()?;
+        let id = repo::resolve(&repo, revision)?.to_string();
+        let directory = self.rel_path(std::path::Path::new(directory))?;
+        let tree = if directory.is_empty() { id } else { format!("{id}:{directory}") };
+        let out = cli::run(self.root(), &["ls-tree", "-z", "--", &tree], None)?;
+        Ok(out
+            .stdout
+            .split(|b| *b == 0)
+            .filter_map(|line| {
+                let split = line.iter().position(|b| *b == b'\t')?;
+                let name = String::from_utf8_lossy(&line[split + 1..]);
+                let dir = line.starts_with(b"040000 ");
+                Some(format!(
+                    "{}{name}{}",
+                    if directory.is_empty() { String::new() } else { format!("{directory}/") },
+                    if dir { "/" } else { "" }
+                ))
+            })
+            .collect())
+    }
+
+    pub fn revision_files(&self, revision: &str) -> IdeResult<Vec<String>> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        let repo = self.gix()?;
+        let id = repo::resolve(&repo, revision)?.to_string();
+        let out = cli::run(self.root(), &["ls-tree", "-r", "-z", "--name-only", "--", &id], None)?;
+        Ok(out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect())
     }
     /// Files changed by `commit` relative to its first parent (renames detected).
     pub fn commit_files(&self, commit: &str) -> IdeResult<Vec<ChangedFile>> {
@@ -761,7 +1056,7 @@ impl Repo {
     /// `amend` keeps the previous message.
     pub fn commit(&self, message: &str, amend: bool, sign_off: bool) -> IdeResult<String> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
-        let options = CommitOptions { amend, sign_off, author: None, run_hooks: true, partial: Vec::new() };
+        let options = CommitOptions { amend, sign_off, author: None, run_hooks: true, ..Default::default() };
         write::commit(self, message, &options, &|_| Ok(encoding_rs::UTF_8.into()))
     }
     /// Commits with the Commit Options popup's choices.
@@ -803,6 +1098,17 @@ impl Repo {
         write::undo_commit(self, commit)
     }
     /// Deletes a local branch (`git branch -d`, `-D` when `force`).
+    /// Edit Commit Message without touching the index or the working tree; returns HEAD
+    /// before and after.
+    pub fn reword(&self, commit: &str, message: &str) -> IdeResult<HeadChange> {
+        write::reword(self, commit, message).map(|(before, after)| HeadChange { before, after })
+    }
+
+    /// Undoes a history rewrite: HEAD goes from `after` back to `before`, local changes kept.
+    pub fn restore_head(&self, before: &str, after: &str) -> IdeResult<()> {
+        write::restore_head(self, before, after)
+    }
+
     pub fn delete_branch(&self, branch: &str, force: bool) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         write::delete_branch(self, branch, force)
@@ -879,9 +1185,11 @@ impl Repo {
     pub fn pull(&self, rebase: bool, cancel: &CancellationToken, on_output: &dyn Fn(String)) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         let mode: &[&str] = if rebase { &["--rebase"] } else { &["--no-rebase", "--ff"] };
-        let mut args = vec!["pull", "--progress", "--autostash"];
+        let mut args = vec!["pull", "--progress"];
         args.extend_from_slice(mode);
-        cli::run_streaming(&self.root, &args, cancel, on_output)
+        preserve::around(self, "Local changes saved before update", || {
+            cli::run_streaming(&self.root, &args, cancel, on_output)
+        })
     }
     /// Pushes the current branch. `set_upstream` pushes to the branch's remote (or
     /// `origin`) under the same name and records it as upstream.
@@ -892,8 +1200,7 @@ impl Repo {
         cancel: &CancellationToken,
         on_output: &dyn Fn(String),
     ) -> IdeResult<()> {
-        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
-        write::push(self, force_with_lease, set_upstream, None, cancel, on_output)
+        self.push_with(PushOptions { force_with_lease, set_upstream, ..Default::default() }, cancel, on_output)
     }
     /// [`Repo::push`] that also pushes tags (Push dialog › Push tags).
     pub fn push_with_tags(
@@ -904,8 +1211,22 @@ impl Repo {
         cancel: &CancellationToken,
         on_output: &dyn Fn(String),
     ) -> IdeResult<()> {
+        self.push_with(PushOptions { force_with_lease, set_upstream, tags, ..Default::default() }, cancel, on_output)
+    }
+    /// Pushes the current branch with the Push dialog's options.
+    pub fn push_with(
+        &self,
+        options: PushOptions,
+        cancel: &CancellationToken,
+        on_output: &dyn Fn(String),
+    ) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
-        write::push(self, force_with_lease, set_upstream, tags, cancel, on_output)
+        write::push(self, options, cancel, on_output)
+    }
+    /// Whether the repository has an executable hook `name` (e.g. `pre-push`), wherever
+    /// `core.hooksPath` puts it: the Push dialog then offers to skip it.
+    pub fn has_hook(&self, name: &str) -> IdeResult<bool> {
+        write::has_hook(self, name)
     }
     /// Pushes a local branch, or its history up to `revision`, to its upstream (Git Log
     /// › Push…, Push All up to Here).
@@ -939,6 +1260,12 @@ impl Repo {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         write::push_branch(self, branch, options, cancel, on_output)
     }
+    /// Update Project › Reset to the Remote Branch: the current branch is moved to its
+    /// freshly fetched tracked branch; local commits are dropped, local changes kept.
+    pub fn reset_to_upstream(&self, cancel: &CancellationToken, on_output: &dyn Fn(String)) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        write::reset_to_upstream(self, cancel, on_output)
+    }
     /// Fast-forwards a local branch that is not checked out to its upstream (Branches ›
     /// Update). Fails when the branch has diverged.
     pub fn update_branch(&self, branch: &str, cancel: &CancellationToken, on_output: &dyn Fn(String)) -> IdeResult<()> {
@@ -951,7 +1278,12 @@ impl Repo {
     /// conflicts are unresolved.
     pub fn continue_operation(&self, cancel: &CancellationToken, on_output: &dyn Fn(String)) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
-        ops::continue_op(self, cancel, on_output)
+        ops::continue_op(self, false, cancel, on_output)
+    }
+    /// Stage and Retry: stages the changes of tracked files, then continues.
+    pub fn stage_and_continue(&self, cancel: &CancellationToken, on_output: &dyn Fn(String)) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        ops::continue_op(self, true, cancel, on_output)
     }
     pub fn abort_operation(&self, cancel: &CancellationToken, on_output: &dyn Fn(String)) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
@@ -969,8 +1301,18 @@ impl Repo {
         cancel: &CancellationToken,
         on_output: &dyn Fn(String),
     ) -> IdeResult<()> {
+        self.cherry_pick_with(commits, false, cancel, on_output)
+    }
+    /// [`Repo::cherry_pick`]; `record_origin` adds "(cherry picked from commit …)" (`-x`).
+    pub fn cherry_pick_with(
+        &self,
+        commits: &[String],
+        record_origin: bool,
+        cancel: &CancellationToken,
+        on_output: &dyn Fn(String),
+    ) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
-        ops::cherry_pick(self, commits, cancel, on_output)
+        ops::cherry_pick(self, commits, record_origin, cancel, on_output)
     }
     /// Reverts `commits` in order (newest first) with git's default messages.
     pub fn revert(&self, commits: &[String], cancel: &CancellationToken, on_output: &dyn Fn(String)) -> IdeResult<()> {
@@ -1006,6 +1348,38 @@ impl Repo {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         ops::create_tag(self, name, commit, message, force)
     }
+    /// Deletes a local tag, returning what [`Repo::restore_tag`] needs to undo it.
+    pub fn delete_tag(&self, name: &str) -> IdeResult<DeletedTag> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        ops::delete_tag(self, name)
+    }
+    /// Recreates a deleted tag (annotated ones with their message).
+    pub fn restore_tag(&self, deleted: &DeletedTag) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        ops::restore_tag(self, deleted)
+    }
+    /// Pushes one tag to `remote` (Push Tag › Push to …).
+    pub fn push_tag(
+        &self,
+        tag: &str,
+        remote: &str,
+        cancel: &CancellationToken,
+        on_output: &dyn Fn(String),
+    ) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        ops::push_tag(self, tag, remote, false, cancel, on_output)
+    }
+    /// Deletes a tag on `remote` (Delete on Remote, after deleting it locally).
+    pub fn delete_remote_tag(
+        &self,
+        tag: &str,
+        remote: &str,
+        cancel: &CancellationToken,
+        on_output: &dyn Fn(String),
+    ) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        ops::push_tag(self, tag, remote, true, cancel, on_output)
+    }
     pub fn tags(&self) -> IdeResult<Vec<String>> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         ops::tags(self)
@@ -1014,6 +1388,12 @@ impl Repo {
     pub fn diff_revisions(&self, from: &str, to: &str) -> IdeResult<Vec<ChangedFile>> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         ops::diff_revisions(self, from, to)
+    }
+    /// Added and deleted lines between `from` and `to`. `paths` limits the diff to those
+    /// repository-relative paths (both names of a rename); empty diffs every file.
+    pub fn diff_numstat(&self, from: &str, to: &str, paths: &[String]) -> IdeResult<Vec<FileLineStats>> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        ops::diff_numstat(self, from, to, paths)
     }
     /// Tracked files whose working-tree content differs from `rev`.
     pub fn diff_with_worktree(&self, rev: &str) -> IdeResult<Vec<ChangedFile>> {
