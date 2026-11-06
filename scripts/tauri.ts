@@ -66,9 +66,10 @@ async function main(): Promise<number> {
   let vite: import("vite").ViteDevServer | undefined;
   try {
     const { createServer } = await import("vite");
+    const pinnedProfile = session.identifier === "ai.l0ng.openidea.dev.w5d2f9b152588c7c1";
     vite = await createServer({
       root: worktreeRoot,
-      server: { port: preferredVitePort(session.identifier), strictPort: false },
+      server: { port: pinnedProfile ? 19232 : preferredVitePort(session.identifier), strictPort: pinnedProfile },
     });
     await vite.listen();
     session.devUrl = vite.resolvedUrls?.local[0] ?? vite.resolvedUrls?.network[0];

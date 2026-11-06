@@ -1,10 +1,18 @@
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 import { createConnection, createServer, type Server } from "node:net";
 import { fileURLToPath } from "node:url";
 
 export const worktreeRoot = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 
 export function worktreeId(root: string): string {
+  try {
+    const id = readFileSync(join(root, ".openidea-dev-identity"), "utf8").trim();
+    if (!/^ai\.l0ng\.openidea\.dev\.w[0-9a-fA-F]{16}$/.test(id)) throw new Error("Invalid development identity");
+    return id;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   let hash = 0xcbf29ce484222325n;
   for (const byte of Buffer.from(root)) {
     hash = BigInt.asUintN(64, (hash ^ BigInt(byte)) * 0x100000001b3n);

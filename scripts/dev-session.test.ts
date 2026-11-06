@@ -1,6 +1,9 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:net";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { claimSession, preferredVitePort, withDevConfig, worktreeId } from "./dev-session.ts";
 
 const servers: Server[] = [];
@@ -25,6 +28,18 @@ async function freePort(): Promise<number> {
 }
 
 describe("development worktrees", () => {
+  it("uses a pinned identity when a local profile exists and rejects invalid values", () => {
+    const root = mkdtempSync(join(tmpdir(), "openidea-profile-test-"));
+    try {
+      const path = join(root, ".openidea-dev-identity");
+      writeFileSync(path, "ai.l0ng.openidea.dev.w5d2f9b152588c7c1\n");
+      expect(worktreeId(root)).toBe("ai.l0ng.openidea.dev.w5d2f9b152588c7c1");
+      writeFileSync(path, "invalid");
+      expect(() => worktreeId(root)).toThrow("Invalid development identity");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it("keeps Vite origins stable and uses an available port when the preferred port is occupied", async () => {
     const { createServer: createVite } = await import("vite");
     const preferred = preferredVitePort(worktreeId("/repo/idea"));

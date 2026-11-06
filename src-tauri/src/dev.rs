@@ -1,7 +1,9 @@
-//! Development identity is tied to the compiled worktree, never the launch cwd.
+//! Development identity defaults to the compiled worktree; a local profile can pin it.
 
 pub fn configure(mut context: tauri::Context<tauri::Wry>) -> tauri::Context<tauri::Wry> {
-    context.config_mut().identifier = identifier(env!("OPENIDEA_WORKTREE_ROOT"));
+    context.config_mut().identifier = option_env!("OPENIDEA_DEV_IDENTITY")
+        .map(str::to_owned)
+        .unwrap_or_else(|| identifier(env!("OPENIDEA_WORKTREE_ROOT")));
     context
 }
 
