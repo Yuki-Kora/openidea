@@ -40,7 +40,9 @@
     color var(--dur-fast) var(--ease),
     background var(--dur-fast) var(--ease);
 }
-.tab:hover {
+/* showContextMenu's owner keeps its hover appearance while the menu is open. */
+.tab:hover,
+.tab:where([data-context-menu-open]) {
   background: var(--bg-toolbar-hover);
 }
 .selected,
@@ -86,11 +88,16 @@
 .italic {
   font-style: italic;
 }
+.dimmed {
+  opacity: 0.6;
+}
 .closeSlot {
   position: relative;
   display: flex;
   align-items: center;
   width: 20px;
+  /* Squeezed tabs shrink the label, never the close button (#1740). */
+  flex: none;
   margin-right: 4px;
 }
 .close {
@@ -99,6 +106,7 @@
   transition: opacity var(--dur-fast) var(--ease);
 }
 .tab:hover .close,
+.tab:where([data-context-menu-open]) .close,
 .selected .close,
 .close:focus-visible {
   opacity: 1;
@@ -117,6 +125,7 @@
   transition: opacity var(--dur-fast) var(--ease);
 }
 .tab:hover .closeSlot .modified,
+.tab:where([data-context-menu-open]) .closeSlot .modified,
 .selected .closeSlot .modified {
   opacity: 0;
 }
@@ -139,6 +148,13 @@
 .squeeze .tab {
   flex: 0 1 auto;
   min-width: 40px;
+}
+/* A closable tab keeps room for its close slot: only the label shrinks. */
+.squeeze .closable {
+  min-width: 64px;
+}
+.squeeze .closeSlot {
+  flex: none;
 }
 .squeeze .tabButton {
   flex: 1 1 auto;

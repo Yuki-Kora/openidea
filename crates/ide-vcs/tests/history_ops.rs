@@ -58,8 +58,11 @@ impl Fixture {
         self.git(&["commit", "-q", "-m", msg]);
         self.git(&["rev-parse", "HEAD"])
     }
+    /// The repository of a trusted project.
     fn repo(&self) -> Repo {
-        Repo::discover(&self.dir).unwrap().expect("repository found")
+        let repo = Repo::discover(&self.dir).unwrap().expect("repository found");
+        repo.set_execution_allowed(true);
+        repo
     }
     fn path(&self, rel: &str) -> PathBuf {
         self.dir.join(rel)
@@ -147,6 +150,21 @@ fn merge_versions_put_the_users_work_on_the_left() {
     assert_eq!(v.sides.commit.as_deref(), Some(&main[..8]));
     repo.abort_operation(&cancel, &out).unwrap();
     assert_eq!(repo.merge_sides().unwrap(), MergeSides { branch: Some("topic".into()), ..Default::default() });
+}
+
+#[test]
+fn rebase_conflict_names_the_remote_branch_without_its_symbolic_aliases() {
+    let fx = diverged();
+    let main = fx.git(&["rev-parse", "main"]);
+    fx.git(&["update-ref", "refs/remotes/origin/main", &main]);
+    fx.git(&["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+    fx.git(&["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/origin/main"]);
+    fx.git(&["branch", "-D", "main"]);
+    let repo = fx.repo();
+    assert!(repo.rebase("origin/main").is_err());
+    assert_eq!(repo.merge_sides().unwrap().other_branch.as_deref(), Some("origin/main"));
+    let (cancel, out) = quiet();
+    repo.abort_operation(&cancel, &out).unwrap();
 }
 
 #[test]

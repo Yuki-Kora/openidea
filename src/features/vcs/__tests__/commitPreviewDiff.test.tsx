@@ -1,5 +1,28 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { EditorInput } from "@/workbench/contributions";
+
+const editor = vi.hoisted(() => ({
+  input: null as EditorInput | null,
+  follow: null as ((input: EditorInput | null) => void) | null,
+}));
+beforeEach(() => {
+  editor.input = null;
+  editor.follow = null;
+});
+
+vi.mock("@/workbench/contributions", async (original) => ({
+  ...(await original<typeof import("@/workbench/contributions")>()),
+  maybeEditorService: () => ({
+    activeInput: () => editor.input,
+    onActiveInputChange: (follow: typeof editor.follow) => {
+      editor.follow = follow;
+      return () => {
+        editor.follow = null;
+      };
+    },
+  }),
+}));
 
 vi.mock("@/platform/ipc", async (importOriginal) => {
   const real = await importOriginal<typeof import("@/platform/ipc")>();
@@ -20,6 +43,7 @@ vi.mock("../diffInput", async (original) => ({
 
 import { CommitToolWindow } from "../CommitView";
 import { setCommitDiffPreview, useCommit } from "../commitStore";
+import { diffInput, workingDiffData } from "../diffInput";
 import { useVcs } from "../store";
 
 /** The splitter between the changes and the preview: the only vertical one in the layout. */
@@ -139,5 +163,141 @@ describe("Commit tool window Preview Diff (#1599)", () => {
     act(() => setCommitDiffPreview(true));
     expect(screen.getByText("No changes to preview")).toBeTruthy();
     expect(screen.queryByTestId("diff-preview")).toBeNull();
+  });
+});
+
+it("follows the active working diff without following other revisions or taking focus", () => {
+  useCommit.setState({ commitDiffPreview: false, selection: [] });
+  useVcs.setState({
+    available: true,
+    root: "/p",
+    repo: "/p",
+    roots: ["/p"],
+    status: [modified("/p/a.ts"), modified("/p/b.ts")],
+  });
+  render(<CommitToolWindow />);
+  const message = screen.getByPlaceholderText("Commit Message");
+  message.focus();
+  act(() => editor.follow?.(diffInput(workingDiffData("/p/b.ts"))));
+  expect(useCommit.getState().selection).toEqual(["/p/b.ts"]);
+  expect(screen.getByRole("treeitem", { name: /b.ts/ })).toHaveAttribute("aria-selected", "true");
+  expect(document.activeElement).toBe(message);
+  act(() =>
+    editor.follow?.(
+      diffInput({ path: "/p/a.ts", left: { type: "rev", rev: "old" }, right: { type: "rev", rev: "new" } }),
+    ),
+  );
+  expect(useCommit.getState().selection).toEqual(["/p/b.ts"]);
+});
+
+describe("following the active diff across Git status refreshes", () => {
+  beforeEach(() => {
+    editor.input = diffInput(workingDiffData("/p/b.ts"));
+    useCommit.setState({ commitDiffPreview: false, selection: [], groupByDir: false, groupByStaging: false });
+    useVcs.setState({
+      available: true,
+      root: "/p",
+      repo: "/p",
+      roots: ["/p"],
+      status: [modified("/p/a.ts"), modified("/p/b.ts")],
+    });
+  });
+
+  it("keeps a manually selected file when status refreshes with the same active diff", () => {
+    render(<CommitToolWindow />);
+    expect(useCommit.getState().selection).toEqual(["/p/b.ts"]);
+    selectFirstFile();
+    expect(useCommit.getState().selection).toEqual(["/p/a.ts"]);
+    act(() => useVcs.setState({ status: [modified("/p/a.ts"), modified("/p/b.ts")] }));
+    expect(useCommit.getState().selection).toEqual(["/p/a.ts"]);
+    act(() => editor.follow?.(editor.input));
+    expect(useCommit.getState().selection).toEqual(["/p/a.ts"]);
+  });
+
+  it("keeps a manually collapsed group across status refreshes", () => {
+    render(<CommitToolWindow />);
+    const tree = screen.getByRole("tree", { name: "Changes" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "Home" });
+    fireEvent.keyDown(tree, { key: "ArrowLeft" });
+    expect(tree.querySelector('[role="treeitem"][aria-expanded="false"]')).toBeTruthy();
+    expect(screen.queryByRole("treeitem", { name: /b.ts/ })).toBeNull();
+    act(() => useVcs.setState({ status: [modified("/p/a.ts"), modified("/p/b.ts")] }));
+    expect(screen.queryByRole("treeitem", { name: /b.ts/ })).toBeNull();
+  });
+
+  it.each([
+    null,
+    diffInput({ path: "/p/b.ts", left: { type: "rev", rev: "old" }, right: { type: "rev", rev: "new" } }),
+  ])("follows the same diff again after switching away from it (%#)", (other) => {
+    render(<CommitToolWindow />);
+    selectFirstFile();
+    act(() => editor.follow?.(other));
+    act(() => editor.follow?.(editor.input));
+    expect(useCommit.getState().selection).toEqual(["/p/b.ts"]);
+  });
+});
+
+it("follows a newly opened diff when its Git status arrives later", () => {
+  editor.input = diffInput(workingDiffData("/p/new.ts"));
+  useCommit.setState({ commitDiffPreview: false, selection: [] });
+  useVcs.setState({ available: true, root: "/p", repo: "/p", roots: ["/p"], status: [] });
+  render(<CommitToolWindow />);
+  act(() => useVcs.setState({ status: [modified("/p/new.ts")] }));
+  expect(useCommit.getState().selection).toEqual(["/p/new.ts"]);
+});
+
+describe("the active diff follows the selected file (#2492)", () => {
+  beforeEach(() => {
+    openDiff.mockClear();
+    useCommit.setState({
+      commitDiffPreview: false,
+      selection: [],
+      groupByDir: false,
+      groupByStaging: false,
+    });
+    useVcs.setState({
+      available: true,
+      root: "/p",
+      repo: "/p",
+      roots: ["/p"],
+      status: [modified("/p/a.ts"), modified("/p/b.ts")],
+    });
+  });
+
+  it("shows the newly selected file in the open diff tab, keeping focus in the tree", () => {
+    editor.input = diffInput(workingDiffData("/p/b.ts"));
+    render(<CommitToolWindow />);
+    selectFirstFile();
+    expect(openDiff).toHaveBeenCalledTimes(1);
+    const [data, opts] = openDiff.mock.calls[0]!;
+    expect(data.path).toBe("/p/a.ts");
+    expect(data.chain?.map((d: { path: string }) => d.path)).toEqual(["/p/a.ts", "/p/b.ts"]);
+    expect(opts).toEqual({ preview: true, focus: false });
+  });
+
+  it.each([
+    ["no tab is open", null],
+    ["the active tab is a file", { kind: "text", key: "/p/b.ts", path: "/p/b.ts" } as EditorInput],
+    [
+      "the active diff compares other revisions",
+      diffInput({
+        path: "/p/b.ts",
+        left: { type: "rev", rev: "old" },
+        right: { type: "rev", rev: "new" },
+      }),
+    ],
+  ])("opens nothing on selection when %s", (_case, input) => {
+    editor.input = input;
+    render(<CommitToolWindow />);
+    selectFirstFile();
+    expect(openDiff).not.toHaveBeenCalled();
+  });
+
+  it("opens nothing when the selection already is the diff's file", () => {
+    editor.input = diffInput(workingDiffData("/p/a.ts"));
+    render(<CommitToolWindow />);
+    selectFirstFile();
+    expect(openDiff).not.toHaveBeenCalled();
   });
 });

@@ -15,6 +15,12 @@ vi.mock("@/platform/ipc", async (orig) => {
 });
 const executeAction = vi.hoisted(() => vi.fn(async () => true));
 vi.mock("@/platform/actions", () => ({ executeAction }));
+vi.mock("@tauri-apps/api/core", async (orig) => ({
+  ...(await orig<object>()),
+  Channel: class {
+    onmessage = () => {};
+  },
+}));
 
 const { lensTargets, usagesLensExtension } = await import("./codeLens");
 const { lspDoc } = await import("./lsp");
@@ -73,6 +79,17 @@ const item = (name: string, kind: OutlineItem["kind"], line: number, children: O
   return { name, kind, detail: null, range: r, selection_range: r, children };
 };
 
+describe("usages label", () => {
+  it("is translated", async () => {
+    const { usagesLabel } = await import("./codeLens");
+    const { setLocale } = await import("@/platform/i18n");
+    expect([0, 1, 3].map(usagesLabel)).toEqual(["no usages", "1 usage", "3 usages"]);
+    await setLocale("zh");
+    expect([0, 1, 3].map(usagesLabel)).toEqual(["无用法", "1 个用法", "3 个用法"]);
+    await setLocale("en");
+  });
+});
+
 describe("usages lens targets", () => {
   it("skips callbacks and anonymous functions", () => {
     const items = [
@@ -89,7 +106,15 @@ describe("background usage counts", () => {
   it("uses the server's existing scope and leaves full searches to the explicit action", async () => {
     const view = editor();
     await settle();
-    expect(ipc.lspReferences).toHaveBeenCalledWith(expect.any(Number), 7, { line: 0, col: 0 }, false, false);
+    expect(ipc.lspReferences).toHaveBeenCalledWith(
+      expect.any(Number),
+      7,
+      { line: 0, col: 0 },
+      false,
+      false,
+      false,
+      expect.anything(),
+    );
     expect(titles(view)).toEqual(["2 usages"]);
     view.state.facet(codeLenses)[0]!.run!(view, new MouseEvent("click"));
     expect(executeAction).toHaveBeenCalledWith("find.showUsages");
@@ -104,6 +129,18 @@ describe("background usage counts", () => {
     expect(executeAction).toHaveBeenCalledWith("find.showUsages");
   });
 
+  it('leaves out "no usages" when Show “no usages” is off', async () => {
+    ipc.lspReferences.mockResolvedValue(refs(0));
+    useProject.setState({
+      settings: {
+        editor: { inlay: { codeVisionUsages: true, codeVisionAuthor: false, codeVisionNoUsages: false } },
+      } as never,
+    });
+    const view = editor();
+    await settle();
+    expect(titles(view)).toEqual([]);
+  });
+
   it("does not cache an incomplete count while indexing, and retries on server refresh", async () => {
     ipc.lspReferences.mockResolvedValueOnce(refs(0, "indexing"));
     const view = editor();
@@ -112,6 +149,29 @@ describe("background usage counts", () => {
     emitLocalIdeEvent({ type: "lspRefresh", kind: "codeLens", server: 1 });
     await settle();
     expect(ipc.lspReferences).toHaveBeenCalledTimes(2);
+    expect(titles(view)).toEqual(["2 usages"]);
+  });
+
+  it("asks again for a count that came back incomplete during a short busy spell", async () => {
+    // jdtls reports progress for a few milliseconds around many requests: no settle follows it.
+    ipc.lspReferences.mockResolvedValueOnce(refs(0, "indexing"));
+    const view = editor();
+    await settle();
+    expect(titles(view)).toEqual([]);
+    await settle();
+    expect(ipc.lspReferences).toHaveBeenCalledTimes(2);
+    expect(titles(view)).toEqual(["2 usages"]);
+  });
+
+  it("stops asking again while the server keeps saying it is indexing, until it settles", async () => {
+    ipc.lspReferences.mockResolvedValue(refs(0, "indexing"));
+    const view = editor();
+    for (let i = 0; i < 10; i++) await settle();
+    expect(ipc.lspReferences).toHaveBeenCalledTimes(4);
+    expect(titles(view)).toEqual([]);
+    ipc.lspReferences.mockResolvedValue(refs(2));
+    emitLocalIdeEvent({ type: "lspRefresh", kind: "codeLens", server: 1 });
+    await settle();
     expect(titles(view)).toEqual(["2 usages"]);
   });
 

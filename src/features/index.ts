@@ -4,6 +4,7 @@
  * a disposer. The editor provides the editor service; app must install its launch
  * barrier before welcome can restore a remembered project.
  */
+import { activate as mcp } from "./mcp";
 import { activate as projectTrust } from "./project-trust";
 import { activate as editor } from "@/editor/core";
 import { activate as editorLsp } from "@/editor/lsp";
@@ -16,10 +17,12 @@ import {
   activate as vcs,
   activateComparisonWindow,
   activateDiffViewer,
+  activateDiffWindow,
   activateSettingsPages as vcsPages,
 } from "./vcs";
 import { activate as terminal } from "./terminal";
 import { activate as run } from "./run";
+import { activate as dotnet } from "./dotnet";
 import { activate as runAnything } from "./run-anything";
 import { activate as macros } from "./macros";
 import { activate as debuggerFeature } from "./debugger";
@@ -43,7 +46,7 @@ import { activate as notebook } from "./notebook";
 import { activate as web } from "./web";
 import { activate as analysis } from "./analysis";
 import { activate as services } from "./services";
-import { activate as github } from "./github";
+import { activate as github, activateSettingsPages as githubPages } from "./github";
 import { activate as httpClient } from "./http-client";
 import { activate as database } from "./database";
 import { activate as graphql } from "./graphql";
@@ -52,6 +55,7 @@ import { activate as agents, activateSettingsPages as agentsPages } from "./agen
 import { activate as vim, activateSettingsPages as vimPages } from "./vim";
 import { activate as ssh } from "./ssh";
 import { activate as remoteDev } from "./remote-dev";
+import { activate as whatsNew } from "./whats-new";
 
 type Activate = () => void | (() => void);
 
@@ -59,7 +63,9 @@ const features: Array<[string, Activate]> = [
   ["project-trust", projectTrust],
   ["editor", editor],
   ["editor-lsp", editorLsp],
+  ["mcp", mcp],
   ["app", app],
+  ["whats-new", whatsNew],
   ["welcome", welcome],
   ["project-tree", projectTree],
   ["search", search],
@@ -68,6 +74,7 @@ const features: Array<[string, Activate]> = [
   ["vcs", vcs],
   ["terminal", terminal],
   ["run", run],
+  ["dotnet", dotnet],
   ["run-anything", runAnything],
   ["macros", macros],
   ["debugger", debuggerFeature],
@@ -119,7 +126,7 @@ export function activateFeatures(): () => void {
 }
 
 export { SettingsWindow } from "./settings";
-export { ComparisonWindow } from "./vcs";
+export { ComparisonWindow, DiffWindow } from "./vcs";
 export { DeploymentWindow } from "./deployment";
 
 /**
@@ -134,6 +141,20 @@ export function activateComparisonWindowFeatures(parent: string): () => void {
     ["editor", editor],
     ["vcs", vcs],
     ["comparison", () => activateComparisonWindow(parent, (project) => confirmLeave(undefined, project))],
+  ]);
+}
+
+/**
+ * The diff window of project window `parent`: one file's diff, with Git and its own documents but
+ * no workbench.
+ */
+export function activateDiffWindowFeatures(parent: string): () => void {
+  return activateAll("diff window", [
+    ["locale", appLocale],
+    ["settings", activateRuntimeSettings],
+    ["menu", activateMenuBridge],
+    ["vcs", vcs],
+    ["diff", () => activateDiffWindow(parent)],
   ]);
 }
 
@@ -166,6 +187,7 @@ export function activateSettingsWindowFeatures(parent: string): () => void {
     ["agents", agentsPages],
     ["vim", vimPages],
     ["vcs", vcsPages],
+    ["github", githubPages],
   ];
   return activateAll("settings pages", pages);
 }
