@@ -71,6 +71,22 @@ pub(crate) fn register(d: &mut Dispatcher) {
         let id = c.arg::<String>("id")?;
         databases(&c.host, &c.window, &id).await
     });
+    d.add("db_database_catalog", |c| async move {
+        let (id, database) = (c.arg::<String>("id")?, c.arg::<String>("database")?);
+        database_catalog(&c.host, &c.window, &id, &database).await
+    });
+    d.add("db_saved_catalog", |c| async move {
+        let id = c.arg::<String>("id")?;
+        saved_catalog(&c.host, &c.window, &id).await
+    });
+    d.add("db_retain_catalog", |c| async move {
+        let (id, databases) = (c.arg::<String>("id")?, c.arg::<Vec<String>>("databases")?);
+        retain_catalog(&c.host, &c.window, &id, databases).await
+    });
+    d.add("db_session_context", |c| async move {
+        let id = c.arg::<String>("id")?;
+        session_context(&c.host, &c.window, &id).await
+    });
     d.add("db_schemas", |c| async move {
         let id = c.arg::<String>("id")?;
         schemas(&c.host, &c.window, &id).await
@@ -103,7 +119,8 @@ pub(crate) fn register(d: &mut Dispatcher) {
     d.add("db_explain", |c| async move {
         let (request, id, statement) =
             (c.arg::<RequestId>("request")?, c.arg::<String>("id")?, c.arg::<String>("statement")?);
-        explain(&c.host, &c.window, request, &id, &statement).await
+        let schema = c.arg::<Option<String>>("schema")?;
+        explain(&c.host, &c.window, request, &id, &statement, schema.as_deref()).await
     });
     d.add("db_history", |c| async move {
         let id = c.arg::<String>("id")?;
@@ -130,7 +147,8 @@ pub(crate) fn register(d: &mut Dispatcher) {
             c.arg::<Option<u32>>("skip")?.unwrap_or(0),
             c.arg::<u32>("maxRows")?,
         );
-        execute(&c.host, &c.window, request, &id, statements, skip, max_rows).await
+        let schema = c.arg::<Option<String>>("schema")?;
+        execute(&c.host, &c.window, request, &id, statements, skip, max_rows, schema.as_deref()).await
     });
     d.add("db_table_page", |c| async move {
         let (request, id, schema, table) = (
@@ -167,7 +185,12 @@ pub fn sources(host: &Host, window: &str) -> IdeResult<Vec<DataSource>> {
 /// Replaces the project's data sources with `sources`.
 pub async fn save_sources(host: &Host, window: &str, sources: Vec<DataSource>) -> IdeResult<()> {
     let db = host.project(window)?.db.clone();
-    db.save_sources(sources).await
+    db.save_sources(sources).await?;
+    let root = host.project(window)?.root.clone();
+    for project in host.projects().into_iter().filter(|p| p.root == root) {
+        project.sink.emit(ide_core::IdeEvent::DbSourcesChanged);
+    }
+    Ok(())
 }
 
 /// Remembers the password of data source `id` for the session, and in the OS
@@ -239,6 +262,35 @@ pub async fn databases(host: &Host, window: &str, id: &str) -> IdeResult<Databas
     db.databases(id).await
 }
 
+/// The schemas of `database` of Snowflake data source `id` with their tables and views.
+pub async fn database_catalog(
+    host: &Host,
+    window: &str,
+    id: &str,
+    database: &str,
+) -> IdeResult<Vec<ide_db::CatalogSchema>> {
+    let db = host.project(window)?.db.clone();
+    db.database_catalog(id, database).await
+}
+
+/// What earlier introspection of data source `id` saved; the data source is not connected to.
+pub async fn saved_catalog(host: &Host, window: &str, id: &str) -> IdeResult<Option<ide_db::SourceCatalog>> {
+    let db = host.project(window)?.db.clone();
+    db.saved_catalog(id).await
+}
+
+/// Drops the saved databases of data source `id` that are not in `databases` any more.
+pub async fn retain_catalog(host: &Host, window: &str, id: &str, databases: Vec<String>) -> IdeResult<()> {
+    let db = host.project(window)?.db.clone();
+    db.retain_catalog(id, databases).await
+}
+
+/// The warehouse and role of the Snowflake session of data source `id`, and what it may switch to.
+pub async fn session_context(host: &Host, window: &str, id: &str) -> IdeResult<ide_db::SessionContext> {
+    let db = host.project(window)?.db.clone();
+    db.session_context(id).await
+}
+
 /// The schemas of data source `id`.
 pub async fn schemas(host: &Host, window: &str, id: &str) -> IdeResult<Vec<String>> {
     let db = host.project(window)?.db.clone();
@@ -289,10 +341,11 @@ pub async fn explain(
     request: RequestId,
     id: &str,
     statement: &str,
+    schema: Option<&str>,
 ) -> IdeResult<Vec<PlanNode>> {
     let db = host.project(window)?.db.clone();
     let cancel = host.begin_request(request);
-    let result = db.explain(id, statement, &cancel).await;
+    let result = db.explain(id, statement, &cancel, schema).await;
     host.end_request(request);
     result
 }
@@ -327,7 +380,9 @@ pub fn statements(host: &Host, window: &str, id: &str, text: &str, from: u32, to
 
 /// Runs `statements` in order on data source `id`, stopping at the first
 /// error. Each result reads past its first `skip` rows (a later page) and keeps
-/// `max_rows`. Cancel with `cancel_request(request)`.
+/// `max_rows`. `schema` is the console's active context: the connection running
+/// each statement is put in it first. Cancel with `cancel_request(request)`.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     host: &Host,
     window: &str,
@@ -336,12 +391,13 @@ pub async fn execute(
     statements: Vec<SqlStatement>,
     skip: u32,
     max_rows: u32,
+    schema: Option<&str>,
 ) -> IdeResult<Vec<StatementOutcome>> {
     let db = host.project(window)?.db.clone();
     let cancel = host.begin_request(request);
     let mut out = Vec::new();
     for statement in statements {
-        match db.execute_from(id, &statement.text, skip as usize, max_rows.max(1) as usize, &cancel).await {
+        match db.execute_from(id, &statement.text, skip as usize, max_rows.max(1) as usize, &cancel, schema).await {
             Ok(result) => out.push(StatementOutcome { statement, result: Some(result), error: None }),
             Err(e) if e.kind == ide_core::error::ErrorKind::Cancelled => {
                 host.end_request(request);

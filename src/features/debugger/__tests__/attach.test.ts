@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AttachableProcess } from "@/platform/ipc";
+import { usePlatform } from "@/platform/platformInfo";
 
 vi.mock("../java", () => ({
   javaAttachConfig: vi.fn(async (t: { name: string; hostName: string; port: number }, root: string) => ({
@@ -19,7 +20,14 @@ import { attachConfig, attachDetail, attachRows, matchesFilter } from "../attach
 const proc = (p: Partial<AttachableProcess> & Pick<AttachableProcess, "pid" | "kind">): AttachableProcess => ({
   name: p.kind,
   commandLine: `${p.kind} app`,
-  adapter: { java: "java-debug", node: "js-debug", python: "debugpy", go: "delve", native: "codelldb" }[p.kind],
+  adapter: {
+    java: "java-debug",
+    node: "js-debug",
+    python: "debugpy",
+    go: "delve",
+    dotnet: "netcoredbg",
+    native: "codelldb",
+  }[p.kind],
   host: null,
   port: null,
   ...p,
@@ -86,5 +94,38 @@ describe("Attach to Process popup model", () => {
     const native = await attachConfig(list[0]!, "/proj");
     expect(native).toMatchObject({ adapter: "codelldb", request: "attach", name: "a.out (30)", cwd: "/proj" });
     expect(JSON.parse(native.extraJson!)).toEqual({ pid: 30 });
+  });
+
+  it("offers managed and native debugging for the same process", async () => {
+    const native = proc({ pid: 42, kind: "native", name: "UnrealEditor.exe" });
+    const managed = proc({ pid: 42, kind: "dotnet", name: "UnrealEditor.exe" });
+    expect(attachRows([native, managed], "UnrealEditor.exe").map((row) => row.key)).toEqual([
+      "group:dotnet",
+      "dotnet:42",
+      "group:native",
+      "native:42",
+    ]);
+    const config = await attachConfig(managed, "/proj");
+    expect(config).toMatchObject({ adapter: "netcoredbg", request: "attach", name: "UnrealEditor.exe (42)" });
+    expect(JSON.parse(config.extraJson!)).toEqual({ processId: 42 });
+  });
+
+  it("loads Unreal Editor symbols on demand when attaching with lldb-dap on Windows", async () => {
+    const os = usePlatform.getState().os;
+    usePlatform.setState({ os: "windows" });
+    try {
+      const p = proc({ pid: 30, kind: "native", name: "UnrealEditor.exe", adapter: "lldb-dap" });
+      expect(JSON.parse((await attachConfig(p, "/proj")).extraJson!)).toEqual({
+        pid: 30,
+        initCommands: [
+          "settings set target.preload-symbols false",
+          "settings set symbols.load-on-demand true",
+          "settings set target.load-script-from-symbol-file false",
+        ],
+      });
+      expect(JSON.parse((await attachConfig({ ...p, name: "app.exe" }, "/proj")).extraJson!)).toEqual({ pid: 30 });
+    } finally {
+      usePlatform.setState({ os });
+    }
   });
 });

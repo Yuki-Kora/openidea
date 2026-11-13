@@ -2,7 +2,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type MutableRefObject } from "react";
 import { basename, relativePath, useProject } from "@/platform/project";
 import { executeAction, getAction } from "@/platform/actions";
-import { call, commands, type AttachableProcess, type RunConfig, type Variable } from "@/platform/ipc";
+import type { AttachableProcess, RunConfig, Variable } from "@/platform/ipc";
 import { maybeEditorService, notifications } from "@/workbench/contributions";
 import { Button, Checkbox, Dialog, Icon, IconButton, Input, Kbd, List, Menu, Popup, Toggle, T } from "@/ui";
 import { isConditional, suspends, type BreakpointEntry } from "../breakpoints/model";
@@ -13,7 +13,8 @@ import {
   updateBreakpoint,
   useBreakpoints,
 } from "../breakpoints/store";
-import { activeSession, addWatch, evaluate, isLive, startSession, useDebug, resumeExecution } from "../state";
+import { activeSession, addWatch, evaluate, isLive, startSession, useDebug } from "../state";
+import { cancelSmartStep, chooseStepTarget } from "../editor/smartStep";
 import {
   addMethodBreakpoint,
   removeAllSpecial,
@@ -706,7 +707,7 @@ function EvaluateDialogInner({ initial }: { initial: string }) {
     setHistory(readHistory("evaluate"));
     historyPos.current = -1;
     try {
-      const v: Variable = await evaluate(e, "repl", session ?? null);
+      const v: Variable = await evaluate(e, session?.adapter === "gdb" ? "watch" : "repl", session ?? null);
       setResult({ key: `eval:${e}:${Date.now()}`, kind: "eval", name: e, variable: v, error: null });
     } catch (err) {
       setResult({ key: `eval:${e}:${Date.now()}`, kind: "eval", name: e, variable: null, error: errorText(err) });
@@ -980,23 +981,21 @@ function SmartStepChooser() {
   const all = useOverlays((s) => s.smartStep);
   // Picked in the editor instead.
   const state = all?.inline ? null : all;
-  const close = () => useOverlays.setState({ smartStep: null });
-  const pick = (targetId: number) => {
-    if (!state) return;
-    close();
-    void resumeExecution(state.session, () =>
-      call(commands.debugStepInTarget(state.session, state.thread, targetId)),
-    ).catch((e) =>
-      notifications().notify({ group: "run", level: "error", title: "Smart Step Into failed", body: errorText(e) }),
-    );
-  };
+
   return (
-    <Dialog open={!!state} onClose={close} title="Step Into" width={420} position="top" aria-label="Smart Step Into">
+    <Dialog
+      open={!!state}
+      onClose={cancelSmartStep}
+      title="Step Into"
+      width={420}
+      position="top"
+      aria-label="Smart Step Into"
+    >
       <List
         items={state?.targets ?? []}
         getKey={(t) => String(t.id)}
         defaultActiveIndex={0}
-        onActivate={(t) => pick(t.id)}
+        onActivate={(t) => chooseStepTarget(t.id)}
         aria-label="Calls on the current line"
         className={styles.chooser}
         renderItem={(t) => (

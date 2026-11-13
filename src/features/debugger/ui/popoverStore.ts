@@ -2,6 +2,8 @@
 import { create } from "zustand";
 import type { AttachableProcess, DebugSessionId, RunConfig, StepInTarget } from "@/platform/ipc";
 
+export type SmartStepTarget = StepInTarget & { functionName?: string };
+
 /** A Smart Step Into target placed on the paused line (UTF-16 offsets within the line). */
 export interface InlineStepTarget {
   id: number;
@@ -23,7 +25,8 @@ interface OverlayState {
   smartStep: {
     session: DebugSessionId;
     thread: number;
-    targets: StepInTarget[];
+    targets: SmartStepTarget[];
+    stopSeq: number;
     inline?: { path: string; line: number; ranges: InlineStepTarget[]; index: number };
   } | null;
 }
@@ -57,6 +60,11 @@ export function openConfigChooser(configs: RunConfig[]) {
   useOverlays.setState({ chooser: { configs } });
 }
 
-export function openSmartStepChooser(session: DebugSessionId, thread: number, targets: StepInTarget[]) {
-  useOverlays.setState({ smartStep: { session, thread, targets } });
+export function openSmartStepChooser(
+  session: DebugSessionId,
+  thread: number,
+  targets: SmartStepTarget[],
+  stopSeq: number,
+) {
+  useOverlays.setState({ smartStep: { session, thread, targets, stopSeq } });
 }

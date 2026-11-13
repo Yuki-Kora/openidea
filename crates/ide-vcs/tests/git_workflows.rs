@@ -103,8 +103,11 @@ impl Fixture {
     fn subjects(&self) -> Vec<String> {
         self.git(&["log", "--format=%s"]).lines().map(str::to_string).collect()
     }
+    /// The repository of a trusted project.
     fn repo(&self) -> Repo {
-        Repo::discover(&self.dir).unwrap().expect("repository found")
+        let repo = Repo::discover(&self.dir).unwrap().expect("repository found");
+        repo.set_execution_allowed(true);
+        repo
     }
     fn path(&self, rel: &str) -> PathBuf {
         self.dir.join(rel)
@@ -948,6 +951,36 @@ fn branch_create_checkout_merge_rebase_delete() {
     assert!(err.message.contains("not fully merged"), "{}", err.message);
     repo.delete_branch("unmerged", true).unwrap();
     assert!(!repo.branches().unwrap().iter().any(|b| b.name == "unmerged"));
+}
+
+#[test]
+fn branch_overwrite_preserves_the_ref_if_checkout_fails() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "base\n");
+    let base = fx.commit_all("base");
+    fx.write("a.txt", "main\n");
+    let tip = fx.commit_all("main");
+    let repo = fx.repo();
+    repo.create_branch("topic", None, false).unwrap();
+
+    repo.create_branch_with_overwrite("topic", Some(&base), false, true).unwrap();
+    assert_eq!(fx.git(&["rev-parse", "topic"]), base);
+    assert_eq!(fx.git(&["rev-parse", "HEAD"]), tip);
+
+    repo.create_branch_with_overwrite("topic", Some(&tip), false, true).unwrap();
+    fx.write("a.txt", "dirty\n");
+    assert!(repo.create_branch_with_overwrite("topic", Some(&base), true, true).is_err());
+    assert_eq!(fx.git(&["rev-parse", "topic"]), tip);
+    assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("main"));
+    assert_eq!(fx.read("a.txt"), "dirty\n");
+
+    fx.write("a.txt", "main\n");
+    repo.create_branch_with_overwrite("topic", Some(&base), true, true).unwrap();
+    assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("topic"));
+    assert_eq!(fx.git(&["rev-parse", "HEAD"]), base);
+
+    repo.create_branch_with_overwrite("topic", Some(&tip), true, true).unwrap();
+    assert_eq!(fx.git(&["rev-parse", "HEAD"]), tip);
 }
 
 #[test]

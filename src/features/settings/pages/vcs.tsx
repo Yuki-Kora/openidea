@@ -8,6 +8,7 @@ import { useEffect, useId, useState } from "react";
 import { call, commands, isTauri } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 import { WORKFLOW_LIMITS, type IssueLinkValid } from "@/platform/workflowSettings";
+import { showInFileManagerLabel } from "@/platform/fileManager";
 import { Button, Icon, Input, Select, type SelectOption, T } from "@/ui";
 import { setProjectVcs, useProjectVcs, type VcsChoice } from "@/platform/projectVcs";
 import { Row, SettingSelect } from "../components/Form";
@@ -63,10 +64,25 @@ function MappingsTable() {
                 <Icon name="folder" size={16} className={styles.mappingIcon} />
                 {tx("<Project>")} {project.root}
               </td>
-              <td><Select<VcsChoice> aria-label={tx("VCS")} value={choice} onChange={setProjectVcs} options={[
-                { value: "auto", label: "Auto" }, { value: "git", label: "Git" },
-                { value: "perforce", label: "Perforce" }, { value: "none", label: "None" },
-              ]} />{choice === "auto" && <span role="status"> {provider === "ambiguous" ? "Git + Perforce: please select one" : provider}</span>}</td>
+              <td>
+                <Select<VcsChoice>
+                  aria-label={tx("VCS")}
+                  value={choice}
+                  onChange={setProjectVcs}
+                  options={[
+                    { value: "auto", label: "Auto" },
+                    { value: "git", label: "Git" },
+                    { value: "perforce", label: "Perforce" },
+                    { value: "none", label: "None" },
+                  ]}
+                />
+                {choice === "auto" && (
+                  <span role="status">
+                    {" "}
+                    {provider === "ambiguous" ? "Git + Perforce: please select one" : provider}
+                  </span>
+                )}
+              </td>
             </tr>
           )}
         </tbody>
@@ -227,7 +243,7 @@ function PushDialogRows() {
 const PATCH_CREATED: SelectOption[] = [
   { value: "ask", label: "Ask" },
   { value: "no", label: "No" },
-  { value: "reveal", label: "Show in Finder" },
+  { value: "reveal", label: showInFileManagerLabel() },
 ];
 
 const INCOMING: SelectOption[] = [
@@ -498,6 +514,11 @@ export const VCS_PAGES: PageSpec[] = [
             component: GitExecutableRow,
           },
           { kind: "toggle", key: "vcs.git.inlineBlame", label: "Show inline blame for the current line" },
+          {
+            kind: "toggle",
+            key: "vcs.git.showBranchInProjectView",
+            label: "Show branch and incoming/outgoing commits in the Project view",
+          },
         ],
       },
       {

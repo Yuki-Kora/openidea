@@ -5,6 +5,7 @@ import { useProject } from "@/platform/project";
 import { usePlugins } from "./store";
 import { useEditorRegistry } from "@/editor/api";
 import { lspDoc } from "@/editor/lsp/lsp";
+import { synchronizeDocumentIndexes } from "@/workbench/contributions";
 
 const mocks = vi.hoisted(() => ({
   files: vi.fn(),
@@ -126,5 +127,91 @@ it("keeps warm indexes when API 1.0 reclaims an idle Wasm instance", async () =>
   usePlugins.setState({ plugins: usePlugins.getState().plugins.map((p) => ({ ...p, status: "inactive" })) });
   await vi.advanceTimersByTimeAsync(250);
   expect(mocks.files).toHaveBeenCalledTimes(1);
+  expect(mocks.index).not.toHaveBeenCalled();
+});
+
+it("flushes pending changes before usages or rename without waiting for the debounce", async () => {
+  off = startPluginNavigation();
+  await vi.advanceTimersByTimeAsync(250);
+  mocks.index.mockClear();
+  mocks.events.get("fsChanged")?.({ created: [], modified: ["/project/A.xml"], removed: [] });
+  await synchronizeDocumentIndexes("/project/A.xml", "refactor");
+  expect(mocks.index).toHaveBeenCalledExactlyOnceWith(["/project/A.xml"], expect.any(Number));
+});
+
+it("waits for an active batch, then indexes changes queued while it was running", async () => {
+  off = startPluginNavigation();
+  await vi.advanceTimersByTimeAsync(250);
+  let resolve!: (result: { status: "ok"; data: null }) => void;
+  mocks.index.mockImplementationOnce(
+    () =>
+      new Promise((done) => {
+        resolve = done;
+      }),
+  );
+  mocks.events.get("fsChanged")?.({ created: [], modified: ["/project/A.xml"], removed: [] });
+  await vi.advanceTimersByTimeAsync(40);
+  mocks.events.get("fsChanged")?.({ created: [], modified: ["/project/A.java"], removed: [] });
+  let settled = false;
+  const waiting = synchronizeDocumentIndexes("/project/A.xml", "refactor").then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  resolve({ status: "ok", data: null });
+  await waiting;
+  expect(mocks.index).toHaveBeenLastCalledWith(["/project/A.java"], expect.any(Number));
+});
+
+it("refuses refactoring if a queued index batch failed", async () => {
+  off = startPluginNavigation();
+  await vi.advanceTimersByTimeAsync(250);
+  mocks.index.mockResolvedValueOnce({ status: "error", error: { kind: "unavailable", message: "indexer failed" } });
+  mocks.events.get("fsChanged")?.({ created: [], modified: ["/project/A.xml"], removed: [] });
+  await expect(synchronizeDocumentIndexes("/project/A.xml", "refactor")).rejects.toThrow(
+    "Plugin indexes could not be updated",
+  );
+});
+
+it("lets usages go ahead, marked incomplete, while a failed batch keeps failing", async () => {
+  off = startPluginNavigation();
+  await vi.advanceTimersByTimeAsync(250);
+  const failure = { status: "error", error: { kind: "unavailable", message: "indexer failed" } };
+  mocks.index.mockResolvedValue(failure);
+  mocks.events.get("fsChanged")?.({ created: [], modified: ["/project/A.xml"], removed: [] });
+  await vi.advanceTimersByTimeAsync(40);
+  // Every later search used to fail with "still updating" although nothing was running.
+  await expect(synchronizeDocumentIndexes("/project/A.java", "usages")).resolves.toBe(false);
+  await expect(synchronizeDocumentIndexes("/project/A.java", "usages")).resolves.toBe(false);
+});
+
+it("retries a failed batch before the next usages or refactoring", async () => {
+  off = startPluginNavigation();
+  await vi.advanceTimersByTimeAsync(250);
+  mocks.index.mockResolvedValueOnce({ status: "error", error: { kind: "unavailable", message: "indexer failed" } });
+  mocks.events.get("fsChanged")?.({ created: [], modified: ["/project/A.xml"], removed: [] });
+  await vi.advanceTimersByTimeAsync(40);
+  mocks.index.mockClear();
+  await expect(synchronizeDocumentIndexes("/project/A.java", "refactor")).resolves.toBe(true);
+  expect(mocks.index).toHaveBeenCalledWith(["/project/A.xml"], expect.any(Number));
+  await expect(synchronizeDocumentIndexes("/project/A.java", "usages")).resolves.toBe(true);
+});
+
+it.each(["/project/notes.txt", "/external/Other.xml", "jdt://contents/Other.xml"])(
+  "does not block unowned %s while a plugin batch is running",
+  async (path) => {
+    off = startPluginNavigation();
+    await vi.advanceTimersByTimeAsync(250);
+    mocks.index.mockImplementationOnce(() => new Promise(() => {}));
+    mocks.events.get("fsChanged")?.({ created: [], modified: ["/project/A.xml"], removed: [] });
+    await vi.advanceTimersByTimeAsync(40);
+    await synchronizeDocumentIndexes(path, "refactor");
+  },
+);
+
+it("keeps unrelated language-server queries available when plugin discovery fails", async () => {
+  mocks.files.mockRejectedValue(new Error("Plugin file inventory is unavailable"));
+  off = startPluginNavigation();
+  await expect(synchronizeDocumentIndexes("/project/notes.txt", "refactor")).resolves.toBe(true);
   expect(mocks.index).not.toHaveBeenCalled();
 });

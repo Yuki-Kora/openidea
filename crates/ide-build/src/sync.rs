@@ -73,6 +73,9 @@ struct GradleCache {
     /// The projects as Gradle evaluated them; empty in caches from before they were read.
     #[serde(default)]
     projects: Vec<ReportedProject>,
+    /// The projects report how their resources are processed; older caches are stale.
+    #[serde(default)]
+    resources: bool,
 }
 
 /// Init script printing every project, its source sets and Java version once configured.
@@ -94,6 +97,24 @@ fn maven_sync_goals(effective: &Path, offline: bool) -> Vec<String> {
         if offline { "dependency:tree".into() } else { DEPENDENCY_TREE.into() },
         "-Dverbose".into(),
     ]
+}
+
+/// The settings' Maven options for the sync runs: the thread count (`-T`, also
+/// `--threads`) is left out, because the sync pins its own `-T1` — its console
+/// output is parsed as one stream, which a parallel build interleaves.
+fn sync_maven_options(options: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(options.len());
+    let mut args = options.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-T" || arg == "--threads" {
+            args.next(); // the count itself
+        } else if (arg.starts_with("-T") && arg.len() > 2) || arg.starts_with("--threads=") {
+            // `--threads=4` / `-T4`: the count is part of the argument.
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
 }
 const GRADLE_CACHE: &str = "gradle.json";
 const MAVEN_PROFILES: &str = "maven-profiles.json";
@@ -226,11 +247,12 @@ pub fn apply_gradle_cache(root: &Path, cache_dir: &Path, model: &mut GradleModel
             }
         }
     }
-    // A successful sync from before projects were cached has not seen computed includes.
-    let without_projects = cache.error.is_none() && cache.projects.is_empty();
+    // A successful sync from before projects were cached has not seen computed includes,
+    // nor, before resources were read, which launches need Gradle to process them.
+    let outdated = cache.error.is_none() && (cache.projects.is_empty() || !cache.resources);
     model.synced_at = Some(cache.at_ms);
     model.sync_error = cache.error;
-    model.stale = without_projects || cache.hash != hash_gradle_files(&gradle::build_files(root, model));
+    model.stale = outdated || cache.hash != hash_gradle_files(&gradle::build_files(root, model));
 }
 
 // ---------------------------------------------------------------- processes
@@ -286,7 +308,7 @@ pub fn sync_maven(
     let mut model = maven::load_with_linked(
         root,
         maven::default_local_repo(),
-        &options.profiles,
+        &options.maven_settings.profiles(&options.profiles),
         &options.maven_settings.linked_projects,
     );
     maven::UnlinkedProjects::from_model(&model, &options.maven_settings).filter(&mut model);
@@ -323,8 +345,14 @@ pub fn sync_maven(
         // `-T1` keeps mvnd serial: its default parallel build interleaves the
         // `dependency:tree` output of concurrent modules, which the sync parses
         // as one stream. mvn is serial anyway, so this only pins the daemon.
-        let mut args: Vec<String> = vec!["-B".into(), "-fae".into(), "-Dstyle.color=never".into(), "-T1".into()];
-        args.extend(options.maven_options.iter().cloned());
+        let mut args: Vec<String> = vec![
+            "-B".into(),
+            "-fae".into(),
+            "-Dstyle.color=never".into(),
+            "-T1".into(),
+            maven::LOCAL_REPO_TRACKING_ARG.into(),
+        ];
+        args.extend(sync_maven_options(&options.maven_options));
         if options.offline {
             args.push("-o".into());
         }
@@ -438,6 +466,7 @@ pub fn sync_gradle_model(
         error: (!out.success).then(|| error_summary(&out.text)),
         tasks: if out.success { gradle::parse_tasks(&out.text) } else { Vec::new() },
         projects,
+        resources: true,
     };
     write_cache(&cache_dir, GRADLE_CACHE, &cache)
 }
@@ -689,6 +718,7 @@ mod tests {
             test,
             src: src.iter().map(|p| core_src(p)).collect(),
             res: res.iter().map(|p| core_src(p)).collect(),
+            processed: None,
         };
         // A settings script's own println comes first; task listing lines follow.
         let out = format!(
@@ -713,6 +743,15 @@ mod tests {
         );
         let projects = parse_reported_projects(&out);
         assert_eq!(projects.len(), 3, "the malformed line is skipped");
+        // As the init script prints a set whose resources Gradle filters or renames.
+        let processed = parse_reported_projects(&format!(
+            "@openidea-model\t{}",
+            r#"{"path":":","dir":"/p","sourceSets":[{"name":"main","test":false,"src":[],"res":[],"processed":{"task":"processResources","dir":"/p/build/resources/main"}}]}"#
+        ));
+        assert_eq!(
+            processed[0].source_sets[0].processed,
+            Some(gradle::ProcessedResources { task: "processResources".into(), dir: "/p/build/resources/main".into() })
+        );
         let src = |p: &str| PathBuf::from(core_src(p));
         assert_eq!(
             gradle::reported_source_roots(&projects),
@@ -778,12 +817,18 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            resources: true,
         };
         write_cache(&cache_dir, GRADLE_CACHE, &cache).unwrap();
         apply_gradle_cache(&root, &cache_dir, &mut model);
         assert_eq!(model.projects[1].tasks.len(), 1);
         assert!(model.projects[0].tasks.iter().any(|t| t.name == "wrapper"), "root keeps its defaults");
         assert!(!model.stale);
+        write_cache(&cache_dir, GRADLE_CACHE, &GradleCache { resources: false, ..cache.clone() }).unwrap();
+        let mut m = gradle::load(&root).unwrap();
+        apply_gradle_cache(&root, &cache_dir, &mut m);
+        assert!(m.stale, "synced before resource processing was read");
+        write_cache(&cache_dir, GRADLE_CACHE, &cache).unwrap();
 
         let stale_after = |script: &str| {
             std::fs::write(root.join("app/build.gradle"), script).unwrap();
@@ -798,6 +843,41 @@ mod tests {
         let mut m = gradle::load(&root).unwrap();
         apply_gradle_cache(&root, &cache_dir, &mut m);
         assert!(m.stale, "gradle.properties is watched");
+    }
+
+    #[test]
+    fn applied_script_edits_invalidate_the_cached_gradle_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir_all(root.join("gradle")).unwrap();
+        std::fs::write(root.join("build.gradle"), "apply from: 'gradle/dependencies.gradle'").unwrap();
+        let applied = root.join("gradle/dependencies.gradle");
+        std::fs::write(&applied, "implementation 'g:a:1'").unwrap();
+        let model = gradle::load(&root).unwrap();
+        let cache = GradleCache {
+            hash: hash_gradle_files(&gradle::build_files(&root, &model)),
+            projects: vec![ReportedProject {
+                path: ":".into(),
+                dir: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            }],
+            resources: true,
+            ..Default::default()
+        };
+        write_cache(&cache_dir, GRADLE_CACHE, &cache).unwrap();
+        let stale = || {
+            let mut model = gradle::load(&root).unwrap();
+            apply_gradle_cache(&root, &cache_dir, &mut model);
+            model.stale
+        };
+        assert!(!stale());
+        std::fs::write(&applied, "// comment\nimplementation   'g:a:1'\n").unwrap();
+        assert!(!stale());
+        std::fs::write(&applied, "implementation 'g:a:2'").unwrap();
+        assert!(stale());
+        std::fs::remove_file(&applied).unwrap();
+        assert!(stale());
     }
 
     #[test]
@@ -829,6 +909,19 @@ mod tests {
         let text = "[INFO] x\n[ERROR] Failed to execute goal\n[ERROR] \n[ERROR] Re-run Maven using -X\n";
         assert_eq!(error_summary(text), "Failed to execute goal");
         assert_eq!(error_summary("one\nlast line\n\n"), "last line");
+    }
+
+    #[test]
+    fn maven_sync_leaves_out_the_settings_thread_count() {
+        // The sync pins its own `-T1`; the user's `-T` (Settings › Maven) would win
+        // over it on the mvnd command line and interleave the parsed output.
+        let options = ["-s".to_owned(), "settings.xml".to_owned(), "-T".to_owned(), "4".to_owned()];
+        assert_eq!(sync_maven_options(&options), ["-s", "settings.xml"]);
+        let options = ["--threads".to_owned(), "2C".to_owned(), "-Dmaven.repo.local=/m2".to_owned()];
+        assert_eq!(sync_maven_options(&options), ["-Dmaven.repo.local=/m2"]);
+        assert_eq!(sync_maven_options(&["-T4".to_owned()]), Vec::<String>::new());
+        assert_eq!(sync_maven_options(&["--threads=4".to_owned()]), Vec::<String>::new());
+        assert!(sync_maven_options(&[]).is_empty());
     }
 
     #[cfg(unix)]

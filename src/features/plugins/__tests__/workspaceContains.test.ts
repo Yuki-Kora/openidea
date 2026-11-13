@@ -4,6 +4,7 @@ import { useProject } from "@/platform/project";
 import { usePlugins } from "../store";
 import {
   affectsWorkspaceContains,
+  projectHas,
   refreshWorkspaceContains,
   startWorkspaceContains,
   workspaceContainsKeys,
@@ -139,7 +140,7 @@ describe("workspaceContains", () => {
   });
 });
 
-describe("startWorkspaceContains", () => {
+describe.each(["menus", "views"])("startWorkspaceContains (%s)", (point) => {
   const key = "workspaceContains:.devcontainer/devcontainer.json";
   const setProject = (root: string) => useProject.setState({ project: { root, workspace: null } as never });
   const keyIs = (value: boolean) => vi.waitFor(() => expect(getContext()[key]).toBe(value));
@@ -153,10 +154,16 @@ describe("startWorkspaceContains", () => {
   let stop: () => void;
 
   beforeEach(() => {
-    ipc.files = { "/p": ["src"], "/q": [".devcontainer"], "/q/.devcontainer": ["devcontainer.json"] };
+    ipc.files = {
+      "/p": ["src"],
+      "/q": [".devcontainer"],
+      "/q/.devcontainer": ["devcontainer.json"],
+    };
     ipc.readDir.mockReset();
     ipc.readDir.mockImplementation(async (dir: string) => (ipc.files[dir] ?? []).map((name) => ({ name })));
-    usePlugins.setState({ ui: [{ pluginId: "x", point: "menus", key: "k", decl: { when: key } }] as never });
+    usePlugins.setState({
+      ui: [{ pluginId: "x", point, key: "k", decl: { when: key } }] as never,
+    });
     setProject("/p");
     setContext(key, undefined);
     stop = startWorkspaceContains();
@@ -168,11 +175,19 @@ describe("startWorkspaceContains", () => {
     await keyIs(false);
     ipc.files["/p"] = [".devcontainer"];
     ipc.files["/p/.devcontainer"] = ["devcontainer.json"];
-    emit("fsChanged", { created: ["/p/.devcontainer"], modified: [], removed: [] });
+    emit("fsChanged", {
+      created: ["/p/.devcontainer"],
+      modified: [],
+      removed: [],
+    });
     await keyIs(true);
 
     ipc.files["/p/.devcontainer"] = [];
-    emit("fsChanged", { created: [], modified: [], removed: ["/p/.devcontainer/devcontainer.json"] });
+    emit("fsChanged", {
+      created: [],
+      modified: [],
+      removed: ["/p/.devcontainer/devcontainer.json"],
+    });
     await keyIs(false);
   });
 
@@ -202,5 +217,20 @@ describe("startWorkspaceContains", () => {
     stop();
     expect(ipc.handlers.fsChanged).toBeUndefined();
     expect(ipc.handlers.excludedDirsChanged).toBeUndefined();
+  });
+});
+
+describe("projectHas", () => {
+  afterEach(() => useProject.setState({ project: null }));
+
+  it("finds which relative paths the project's roots have, ignoring ones outside it", async () => {
+    useProject.setState({ project: { root: "/p" } as never });
+    const files: Record<string, string[]> = {
+      "/p": ["pom.xml"],
+      "/p/config": ["routes.rb"],
+    };
+    const list = async (dir: string) => files[dir] ?? [];
+    const found = await projectHas(["pom.xml", "config/routes.rb", "go.mod", "../pom.xml"], list);
+    expect([...found].sort()).toEqual(["config/routes.rb", "pom.xml"]);
   });
 });

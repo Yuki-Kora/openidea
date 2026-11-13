@@ -1,3 +1,4 @@
+import { serverCodeLenses } from "./serverCodeLens";
 /**
  * LSP-backed editor features: completion, diagnostics, hover / quick docs,
  * parameter info, navigation, document highlights, intentions, rename,
@@ -27,6 +28,7 @@ import { inlineCompletionExtension, registerInlineCompletionActions } from "./in
 import { semanticExtension } from "./semantic";
 import { usagesLensExtension } from "./codeLens";
 import { autoImportExtension } from "./autoImport";
+import { importsOnPasteExtension, registerImportsOnPasteActions } from "./importsOnPaste";
 import { installConfigurationNavigationEvents } from "./configurationNavigation";
 import { installAvailabilityEvents } from "./availability";
 import { registerActionsOnSave, registerFormatOnSave, registerLspActions } from "./actions";
@@ -45,6 +47,7 @@ import { HierarchyDialog } from "@/editor/refactor";
 export function lspExtensions(ctx: EditorDocContext): Extension[] {
   return [
     lspDoc.of(ctx),
+    serverCodeLenses(ctx),
     lspTheme,
     hintExtension(),
     diagnosticsExtension(),
@@ -60,9 +63,28 @@ export function lspExtensions(ctx: EditorDocContext): Extension[] {
     semanticExtension(),
     usagesLensExtension(),
     autoImportExtension(),
+    importsOnPasteExtension(),
     unresolvedReferences(),
     syntaxErrorsExtension(),
     spellingExtension(),
+  ];
+}
+
+/**
+ * A notebook code cell: completion, hover / quick docs, parameter info, diagnostics, highlights
+ * and ⌘/Ctrl-click navigation. Features that edit other files or need an editor tab (rename,
+ * intentions, inlay hints, lenses) stay with text editors.
+ */
+export function cellLspExtensions(ctx: EditorDocContext): Extension[] {
+  return [
+    lspDoc.of(ctx),
+    lspTheme,
+    hintExtension(),
+    diagnosticsExtension(),
+    hoverExtension(),
+    signatureExtension(),
+    completionExtension(),
+    navigationExtension(),
   ];
 }
 
@@ -71,7 +93,7 @@ export function activate(): () => void {
     installDiagnosticsEvents(),
     installAvailabilityEvents(),
     installConfigurationNavigationEvents(),
-    registerEditorContribution({ id: "lsp", order: 50, extensions: lspExtensions }),
+    registerEditorContribution({ id: "lsp", order: 50, extensions: lspExtensions, cellExtensions: cellLspExtensions }),
     // After the run icons (order 55), as their own gutter column.
     registerEditorContribution({ id: "lsp.lineMarkers", order: 56, extensions: implementationGutter }),
     // After the templates (order 90): live template / postfix expansion keeps ⇥ first.
@@ -92,6 +114,7 @@ export function activate(): () => void {
       component: DocumentationWindow,
     }),
     registerLspActions(),
+    registerImportsOnPasteActions(),
     registerInlineCompletionActions(),
     registerNavigationActions(),
     registerFormatOnSave(),

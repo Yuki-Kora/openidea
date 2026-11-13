@@ -12,11 +12,15 @@
 <p align="center">
   <a href="https://github.com/l0ng-ai/openidea/releases/latest"><b>Download</b></a>
   &nbsp;·&nbsp;
+  <a href="https://openidea.sh">Docs</a>
+  &nbsp;·&nbsp;
   <a href="#benchmark">Benchmark</a>
   &nbsp;·&nbsp;
   <a href="#plugins">Plugins</a>
   &nbsp;·&nbsp;
   <a href="#community">Community</a>
+  &nbsp;·&nbsp;
+  <a href="#sponsor">Sponsor</a>
 </p>
 
 https://github.com/user-attachments/assets/234dd54c-1255-4b3a-b35c-533d78d737c0
@@ -54,7 +58,7 @@ themes, file icons and languages. They run as sandboxed WebAssembly components;
 themes, icon themes and languages need no code at all.
 
 Install them from Settings › Plugins, or start your own with
-`openidea-plugin new` — see [Writing OpenIDEA plugins](plugins/README.md) and
+`openidea-plugin new` — see [Writing OpenIDEA plugins](https://openidea.sh/en/plugins) and
 the [official plugins](plugins/official). The plugin API is still a preview.
 
 ## Community
@@ -62,13 +66,23 @@ the [official plugins](plugins/official). The plugin API is still a preview.
 - [Discord](https://discord.gg/2Zy4yn7gP) — questions, feedback and release news.
 - WeChat group — scan to join:
 
-  <img src="docs/assets/wechat-group.png" alt="WeChat group QR code" width="200">
+  <img src=".github/assets/wechat-group.png" alt="WeChat group QR code" width="200">
+
+- Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md) and the [contributor docs](https://openidea.sh/en/contribute/setup).
+
+## Sponsor
+
+If OpenIDEA saves you time, you can support its development with Alipay or WeChat Pay.
+
+<table>
+  <tr>
+    <td align="center"><img src=".github/assets/sponsor-alipay.png" alt="Alipay QR code" width="200"><br>Alipay</td>
+    <td align="center"><img src=".github/assets/sponsor-wechat.png" alt="WeChat Pay QR code" width="200"><br>WeChat Pay</td>
+  </tr>
+</table>
 
 ## License
 
 [Apache 2.0](LICENSE). Bundled third-party assets are listed in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
-
-Database tool window notes, including Oracle Instant Client setup, are in
-[`docs/databases.md`](docs/databases.md).
 
 <sub>Not affiliated with JetBrains. IntelliJ IDEA is a trademark of JetBrains s.r.o.</sub>

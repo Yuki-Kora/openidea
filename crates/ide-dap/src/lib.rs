@@ -13,8 +13,9 @@ pub mod attach;
 mod cargo;
 pub mod connection;
 pub mod jdwp;
+mod jvm_memory;
 pub mod kotlin;
-mod kotlin_jdwp;
+pub mod kotlin_lsp;
 mod session;
 
 use adapter::{AdapterLauncher, AdapterSpec, ProcessLauncher};
@@ -22,6 +23,7 @@ use connection::{Connection, DapError};
 use futures::future::join_all;
 use ide_core::{DebugSessionId, IdeError, IdeResult, SharedSink};
 use ide_language::LanguageRegistry;
+pub use jvm_memory::*;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -126,6 +128,14 @@ pub struct DebugCapabilities {
     pub log_points: bool,
     /// HotSwap ("Reload Changed Classes"): java-debug's `redefineClasses` request.
     pub hot_code_replace: bool,
+    /// The session debugs a JVM, so it has a Memory view; [`DebugManager::jvm_memory_classes`]
+    /// says why when it has no data (platform, remote JVM, ...).
+    pub jvm_memory: bool,
+    /// The session has a JVM inspector: instances, fields and referrers while suspended. Can
+    /// change during the session ([`ide_core::event::DebugEvent::Capabilities`]).
+    pub jvm_instances: bool,
+    /// The session can be asked for a heap dump ([`DebugManager::jvm_heap_dump`]).
+    pub jvm_heap: bool,
 }
 
 /// Result of [`DebugManager::redefine_classes`].
@@ -282,7 +292,6 @@ impl SessionOwner {
 }
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Redefining many classes in a large JVM can take a while.
@@ -301,6 +310,66 @@ pub struct DebugManager {
     exception_choices: Mutex<BTreeMap<String, bool>>,
     function_breakpoints: Mutex<Vec<FunctionBreakpoint>>,
     data_breakpoints: Mutex<Vec<DataBreakpoint>>,
+    /// In-flight stops, by session: a second Stop sets `stop_force`, the waiting one kills.
+    stopping: Mutex<HashMap<DebugSessionId, Arc<Session>>>,
+    jvm_finder: Mutex<jvm_memory::JvmFinder>,
+}
+
+/// rdbg (Ruby's debug gem) starts the debuggee itself and ignores `launch`'s program,
+/// arguments and environment: they go on its command line after `--` and into its process.
+/// In a Bundler project it runs from the bundle, which must have `debug`: the debuggee then
+/// loads that version, and the gems rdbg needs (irb is not a default gem from Ruby 3.5).
+fn rdbg_command_line(spec: &mut AdapterSpec, config: &LaunchConfig, cwd: &Path) -> IdeResult<()> {
+    if config.request != "launch" {
+        return Ok(());
+    }
+    if spec.command == "rdbg"
+        && let Some(gemfile) = bundler_gemfile(cwd, &config.env)
+    {
+        if !bundles_debug(&gemfile) {
+            return Err(IdeError::unavailable(format!(
+                "the bundle of {} has no `debug` gem. Add `gem \"debug\"` to the Gemfile and run `bundle install`",
+                gemfile.display()
+            )));
+        }
+        spec.args.splice(0..0, ["exec".to_owned(), "rdbg".to_owned()]);
+        spec.command = "bundle".into();
+    }
+    spec.env.extend(config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    spec.args.push("--".into());
+    // With only a command, Ruby's exec treats it as shell text. Ruby entry points
+    // without arguments go through -S so spaces and metacharacters stay literal.
+    if config.program.is_some() && config.args.is_empty() {
+        spec.args.extend(["ruby", "-S", "--"].map(str::to_owned));
+    }
+    spec.args.extend(config.program.iter().cloned());
+    spec.args.extend(config.args.iter().cloned());
+    Ok(())
+}
+
+/// The Gemfile Bundler uses in `dir`: `BUNDLE_GEMFILE`, else the closest `Gemfile` / `gems.rb` from `dir` up.
+fn bundler_gemfile(dir: &Path, env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    let gemfile = env
+        .get("BUNDLE_GEMFILE")
+        .cloned()
+        .or_else(|| ide_core::process::host_var_os("BUNDLE_GEMFILE").map(|v| v.to_string_lossy().into_owned()));
+    match gemfile.filter(|g| !g.is_empty()) {
+        Some(gemfile) => Some(dir.join(gemfile)),
+        None => dir.ancestors().flat_map(|d| [d.join("gems.rb"), d.join("Gemfile")]).find(|g| g.is_file()),
+    }
+}
+
+/// Whether the lockfile of `gemfile` lists the `debug` gem.
+fn bundles_debug(gemfile: &Path) -> bool {
+    let lockfile = if gemfile.file_name().is_some_and(|n| n == "gems.rb") {
+        gemfile.with_file_name("gems.locked")
+    } else {
+        let mut name = gemfile.as_os_str().to_owned();
+        name.push(".lock");
+        PathBuf::from(name)
+    };
+    // The bundle's gems are the lines indented by four spaces: `    debug (1.9.2)`.
+    std::fs::read_to_string(lockfile).is_ok_and(|text| text.lines().any(|l| l.starts_with("    debug (")))
 }
 
 /// Whether the debugged project depends on the Flutter SDK, so it must go
@@ -485,6 +554,17 @@ pub(crate) fn enabled_filters(
         .collect()
 }
 
+fn with_temporary_function(stored: &[FunctionBreakpoint], name: &str) -> Vec<FunctionBreakpoint> {
+    let mut sent = stored.to_vec();
+    for bp in &mut sent {
+        if bp.name == name {
+            bp.enabled = false;
+        }
+    }
+    sent.push(FunctionBreakpoint { name: name.to_owned(), condition: None, hit_condition: None, enabled: true });
+    sent
+}
+
 pub(crate) fn step_in_target_from(t: &Value) -> StepInTarget {
     let num = |k: &str| t.get(k).and_then(Value::as_u64).map(|n| (n as u32).saturating_sub(1));
     StepInTarget {
@@ -508,7 +588,19 @@ pub(crate) fn capabilities_from(caps: &Value) -> DebugCapabilities {
         hit_conditional_breakpoints: has("supportsHitConditionalBreakpoints"),
         log_points: has("supportsLogPoints"),
         hot_code_replace: false,
+        jvm_memory: false,
+        jvm_instances: false,
+        jvm_heap: false,
     }
+}
+
+pub(crate) fn session_capabilities(session: &Session) -> DebugCapabilities {
+    let mut caps = capabilities_from(&session.caps.lock());
+    caps.hot_code_replace = HOT_CODE_REPLACE_ADAPTERS.contains(&session.adapter.as_str());
+    caps.jvm_memory = JVM_MEMORY_ADAPTERS.contains(&session.adapter.as_str());
+    caps.jvm_instances = session.jvm_inspector.lock().is_some();
+    caps.jvm_heap = JVM_MEMORY_ADAPTERS.contains(&session.adapter.as_str());
+    caps
 }
 
 /// States of a file's line breakpoints that no session has been sent.
@@ -528,6 +620,51 @@ fn unverified(enabled: impl Iterator<Item = bool>) -> Vec<BreakpointState> {
     enabled
         .map(|e| BreakpointState { line: 0, verified: false, message: (!e).then(|| "Disabled".to_owned()) })
         .collect()
+}
+
+/// A step request's outcome; a failed one leaves no step pending, so the next stop keeps its reason.
+fn step_settled(session: &Session, sent: Result<Value, DapError>) -> Result<Value, DapError> {
+    if sent.is_err()
+        && let Some(quirks) = session.kotlin_lsp_quirks()
+    {
+        quirks.resume_sent();
+    }
+    sent
+}
+
+/// Delve compiles the debuggee to `__debug_bin` in the session's cwd (in DAP mode a
+/// temp-file name, `__debug_bin<digits>`; on Windows with `.exe` before the digits) and
+/// removes it on a graceful exit — a shutdown it doesn't always reach, so the files pile up. Sweep
+/// the leftovers once the session is down. Runs after `session_closed`, so Delve
+/// has already exited or been killed and holds no file locks; a leftover of a
+/// still-building run is removed on that run's own shutdown.
+fn remove_delve_binaries(cwd: &Path) {
+    let Ok(entries) = std::fs::read_dir(cwd) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // `__debug_bin`, then `.exe` on Windows, then DAP mode's temp-file digits.
+        // Suffixes like `.go` are user files.
+        let suffix = name.strip_prefix("__debug_bin").map(|s| s.strip_prefix(".exe").unwrap_or(s));
+        let leftover = suffix.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit()));
+        if !leftover || entry.file_type().is_ok_and(|t| !t.is_file()) {
+            continue;
+        }
+        // Windows: a just-killed dlv / debuggee can still hold this session's
+        // binary while the previous one's lock is already gone, so one try
+        // leaves exactly the current leftover behind. Retry on a short back-off
+        // to outlast the handle release; a truly busy file is retried into the
+        // next run's sweep anyway.
+        for attempt in 0..5 {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => break,
+                Err(e) if attempt == 4 => {
+                    tracing::debug!("could not remove Delve leftover {}: {e}", entry.path().display());
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1))),
+            }
+        }
+    }
 }
 
 pub(crate) fn variable_from(v: &Value) -> Variable {
@@ -559,7 +696,14 @@ impl DebugManager {
             exception_choices: Mutex::default(),
             function_breakpoints: Mutex::default(),
             data_breakpoints: Mutex::default(),
+            stopping: Mutex::default(),
+            jvm_finder: Mutex::new(Arc::new(jvm_memory::find_local_jvm)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_jvm_finder(&self, finder: jvm_memory::JvmFinder) {
+        *self.jvm_finder.lock() = finder;
     }
 
     fn session(&self, s: DebugSessionId) -> IdeResult<Arc<Session>> {
@@ -620,6 +764,13 @@ impl DebugManager {
         {
             spec.env.push(("JAVA_HOME".into(), home));
         }
+        // Delve looks up Go before applying the debuggee's launch environment.
+        if config.adapter == "delve" {
+            spec.env.extend(config.env.iter().map(|(key, value)| (key.clone(), value.clone())));
+        }
+        if config.adapter == "rdbg" {
+            rdbg_command_line(&mut spec, &config, &cwd)?;
+        }
         if let Some(command) = custom_command(&spec.command) {
             spec.command = command;
         }
@@ -648,6 +799,18 @@ impl DebugManager {
         let debug_server = take_debug_server(&mut arguments)?;
         if let Some(server) = &debug_server {
             spec.server_host = server.host.clone();
+        }
+        if config.adapter == "gdb" && config.request == "launch" && debug_server.is_none() {
+            // GDB's DAP env replaces the entire inferior environment. Ordinary run overrides
+            // instead belong on the adapter process, which the inferior inherits. Explicit
+            // launch JSON keeps GDB's replacement semantics.
+            let explicit_env = config.extra_json.as_deref().is_some_and(|extra| {
+                serde_json::from_str::<Value>(extra).is_ok_and(|extra| extra.get("env").is_some())
+            });
+            if !explicit_env {
+                spec.env.extend(config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+                arguments.as_object_mut().unwrap().remove("env");
+            }
         }
         if let Some(cargo) = arguments.as_object_mut().and_then(|o| o.remove("cargo")) {
             let cargo_args: Vec<String> = cargo
@@ -758,19 +921,29 @@ impl DebugManager {
             return Err(IdeError::invalid(format!("request must be `launch` or `attach`, got `{request}`")));
         }
         let io = self.launcher.launch(spec.clone(), reuse_port).await?;
+        let launch_after_configuration = io.launch_after_configuration && request == "launch";
         let stderr = io.stderr.clone();
         let (conn, incoming) = {
             let stderr = stderr.clone();
             Connection::start_with_output(io.reader, io.writer, Box::new(move |line| adapter::push_line(&stderr, line)))
         };
+        let rdbg_pid = (adapter_name == "rdbg" && request == "launch")
+            .then(|| io.child.as_ref().and_then(tokio::process::Child::id))
+            .flatten();
         let session =
             Arc::new(Session::new(id, owner, name, adapter_name, parent, request, conn, spec, io.port, io.child));
+        // rdbg execs the debuggee in its own process and sends no DAP process event.
+        if let Some(pid) = rdbg_pid {
+            session.debuggee_pid.store(i64::from(pid), Ordering::Release);
+        }
         if let Some(mut output) = io.program_output {
+            session.output_drained.send_replace(false);
             let session = session.clone();
             tokio::spawn(async move {
                 while let Some((category, output)) = output.recv().await {
                     session.emit(ide_core::event::DebugEvent::Output { category: category.into(), output });
                 }
+                session.output_drained.send_replace(true);
             });
         }
         self.sessions.lock().insert(id, session.clone());
@@ -783,7 +956,12 @@ impl DebugManager {
         });
         tokio::spawn(session::event_loop(self.me.clone(), session.clone(), incoming));
 
-        match self.configure(&session, arguments).await {
+        let configured = tokio::select! {
+            biased;
+            _ = session.startup_cancel.cancelled() => return Err(IdeError::cancelled()),
+            result = self.configure(&session, arguments, launch_after_configuration) => result,
+        };
+        match configured {
             Ok(()) => Ok(id),
             Err(e) => {
                 let e = if session.conn.is_closed() {
@@ -808,7 +986,7 @@ impl DebugManager {
         }
     }
 
-    async fn configure(&self, s: &Arc<Session>, mut arguments: Value) -> IdeResult<()> {
+    async fn configure(&self, s: &Arc<Session>, mut arguments: Value, launch_in_config: bool) -> IdeResult<()> {
         if s.adapter == kotlin::ADAPTER {
             let project = arguments
                 .get("projectRoot")
@@ -821,6 +999,7 @@ impl DebugManager {
             arguments["projectRoot"] = json!(mirror.root());
             *s.kotlin_mirror.lock() = Some(mirror);
         }
+        let is_kotlin_lsp = s.adapter == kotlin_lsp::ADAPTER;
         let caps = s
             .conn
             .request_timeout(
@@ -828,7 +1007,7 @@ impl DebugManager {
                 json!({
                     "clientID": "openidea",
                     "clientName": "OpenIDEA",
-                    "adapterID": s.adapter,
+                    "adapterID": if is_kotlin_lsp { kotlin_lsp::DAP_ADAPTER_ID } else { s.adapter.as_str() },
                     "locale": "en",
                     "linesStartAt1": true,
                     "columnsStartAt1": true,
@@ -838,7 +1017,8 @@ impl DebugManager {
                     "supportsRunInTerminalRequest": true,
                     "supportsStartDebuggingRequest": true,
                     "supportsProgressReporting": true,
-                    "supportsInvalidatedEvent": false,
+                    // kotlin-lsp sends `invalidated` either way.
+                    "supportsInvalidatedEvent": is_kotlin_lsp,
                     "supportsMemoryReferences": false,
                     "supportsArgsCanBeInterpretedByShell": false,
                 }),
@@ -847,14 +1027,32 @@ impl DebugManager {
             .await?;
         *s.caps.lock() = if caps.is_object() { caps } else { json!({}) };
 
-        // The Kotlin adapter ignores the resolved classpath and project runtime on launch.
-        let request = if s.adapter == kotlin::ADAPTER && s.request == "launch" {
+        // The Kotlin adapters ignore the resolved classpath and project runtime on launch.
+        let request = if kotlin::is_kotlin(&s.adapter) && s.request == "launch" {
             session::start_kotlin_debuggee(s, &mut arguments).await?;
             "attach"
         } else {
             &s.request
         };
-        if s.adapter == kotlin::ADAPTER {
+        // Both blocks below run before the Kotlin link replaces the JVM's address with its own.
+        if request == "attach"
+            && let Some(target) = jvm_memory::attach_target(&arguments)
+        {
+            let _ = s.attach_target.set(target);
+        }
+        if cfg!(unix)
+            && s.request == "attach"
+            && JVM_MEMORY_ADAPTERS.contains(&s.adapter.as_str())
+            && let Some(port) = jvm_memory::local_jdwp_port(&arguments)
+        {
+            if jdwp::is_listen_relay(port) {
+                s.listen_relay.store(true, Ordering::Release);
+            } else {
+                let finder = self.jvm_finder.lock().clone();
+                jvm_memory::find_attached_jvm(s, port, finder).await;
+            }
+        }
+        if kotlin::is_kotlin(&s.adapter) {
             let host = arguments
                 .get("hostName")
                 .and_then(Value::as_str)
@@ -866,24 +1064,40 @@ impl DebugManager {
                 .and_then(|p| u16::try_from(p).ok())
                 .filter(|p| *p != 0)
                 .ok_or_else(|| IdeError::invalid("Invalid Kotlin JDWP port"))?;
-            let (relay, port) = kotlin_jdwp::StartupRelay::start(host, port).await?;
-            *s.kotlin_relay.lock() = Some(relay);
+            let (link, port) = ide_jdwp::JdwpLink::start(host, port, kotlin::link_options(&s.adapter)).await?;
+            *s.jvm_inspector.lock() = Some(Arc::new(ide_jdwp::LinkInspector::new(link.clone())));
+            jvm_memory::watch_link(s, &link);
+            *s.jdwp_link.lock() = Some(link);
             arguments["hostName"] = json!("127.0.0.1");
             arguments["port"] = json!(port);
         }
-        // Many adapters answer `launch` only after `configurationDone`, so don't wait for it yet.
-        let launch = s.conn.send_request(request, arguments)?;
-        let mut launch = Box::pin(async move { launch.await.unwrap_or(Err(DapError::Closed)) });
+        s.jvm_located.send_replace(true);
+        // Launch/attach may wait for a slow runtime or a remote target. Let the adapter report
+        // failure; Stop cancels configuration and a closed connection fails the pending reply.
+        // Many adapters answer only after `configurationDone`, so don't wait for the reply yet.
+        // GDB 15 is the exception: its `launch` starts the program itself (14 runs at
+        // `configurationDone`, 16+ defers the launch there), so its launch waits below.
+        let mut launch = if launch_in_config {
+            None
+        } else {
+            let reply = s.conn.send_request(request, arguments.clone())?;
+            Some(Box::pin(async move { reply.await.unwrap_or(Err(DapError::Closed)) }))
+        };
         let mut initialized = s.initialized.subscribe();
         let mut launch_result = None;
-        let got_initialized = tokio::select! {
-            r = initialized.wait_for(|v| *v) => { r.map_err(|_| DapError::Closed)?; true }
-            r = &mut launch => {
-                r?;
-                launch_result = Some(());
-                false
+        let got_initialized = match launch.as_mut() {
+            Some(launch) => tokio::select! {
+                r = initialized.wait_for(|v| *v) => { r.map_err(|_| DapError::Closed)?; true }
+                r = launch => {
+                    r?;
+                    launch_result = Some(());
+                    false
+                }
+            },
+            None => {
+                initialized.wait_for(|v| *v).await.map_err(|_| DapError::Closed)?;
+                true
             }
-            _ = tokio::time::sleep(LAUNCH_TIMEOUT) => return Err(DapError::Timeout(s.request.clone()).into()),
         };
         if !got_initialized {
             // Launched before `initialized`; give the adapter a moment to send it.
@@ -897,15 +1111,15 @@ impl DebugManager {
             .lock()
             .iter()
             .map(|(p, b)| (p.clone(), b.clone()))
-            .partition(|(_, b)| b.iter().any(|b| b.enabled));
+            .partition(|(path, b)| s.accepts_source_breakpoints(path) && b.iter().any(|b| b.enabled));
         let sent = join_all(files.iter().map(|(path, bps)| s.send_breakpoints(path, bps, None))).await;
-        // Breakpoint states follow the owner's first session.
-        let first = self.live_sessions().into_iter().find(|f| f.owner.key == s.owner.key).map(|f| f.id) == Some(s.id);
+        // Breakpoint states follow the owner's first session that accepts the source.
+        let owner_sessions: Vec<_> = self.live_sessions().into_iter().filter(|f| f.owner.key == s.owner.key).collect();
         let idle = idle.into_iter().map(|(path, bps)| (path, Ok(unsent(&bps))));
         for (path, result) in files.into_iter().map(|(path, _)| path).zip(sent).chain(idle) {
             match result {
                 Ok(states) => {
-                    if first {
+                    if owner_sessions.iter().find(|f| f.accepts_source_breakpoints(&path)).map(|f| f.id) == Some(s.id) {
                         self.states.lock().insert(path.clone(), states);
                         s.emit(ide_core::event::DebugEvent::BreakpointsChanged { path: path.into() });
                     }
@@ -940,16 +1154,20 @@ impl DebugManager {
             }
         }
         s.configured.store(true, Ordering::Release);
-        if launch_result.is_none() {
-            match tokio::time::timeout(LAUNCH_TIMEOUT, launch).await {
-                Ok(r) => {
-                    r?;
+        match launch.as_mut() {
+            Some(launch) => {
+                if launch_result.is_none() {
+                    launch.await?;
                 }
-                Err(_) => return Err(DapError::Timeout(s.request.clone()).into()),
+            }
+            None => {
+                // GDB 15: the breakpoints are in, so its `run` cannot miss them.
+                let reply = s.conn.send_request(request, arguments)?;
+                reply.await.unwrap_or(Err(DapError::Closed))?;
             }
         }
-        if let Some(relay) = s.kotlin_relay.lock().as_mut() {
-            relay.release();
+        if let Some(link) = s.jdwp_link.lock().as_ref() {
+            link.release();
         }
         Ok(())
     }
@@ -966,21 +1184,77 @@ impl DebugManager {
 
     /// Ends a session: `terminate` (when asked and supported) → `disconnect` → kill.
     pub(crate) async fn shutdown(&self, s: &Arc<Session>, terminate: bool) {
+        if terminate {
+            crate::session::remember_debuggee(s).await;
+        }
+        // java-debug runs the program itself and pipes its stdout over DAP. A `disconnect`
+        // ends that DAP session, so every line the program writes while shutting down is lost.
+        // Ask the program to exit ourselves and keep the adapter attached until it has drained
+        // the console (`terminated`), as IDEA does with the process it owns.
+        let pid = s.debuggee_pid.load(Ordering::Acquire);
+        let own_terminate = terminate && s.request == "launch" && pid > 0;
+        // rdbg's terminate exits the Ruby process without terminating its children.
+        let graceful =
+            terminate && s.request == "launch" && s.adapter != "rdbg" && s.supports("supportsTerminateRequest");
         if !s.conn.is_closed() {
-            if terminate && s.request == "launch" && s.supports("supportsTerminateRequest") {
+            if graceful {
                 let _ = s.conn.request_timeout("terminate", json!({ "restart": false }), SHUTDOWN_TIMEOUT).await;
             }
+            if !graceful && !own_terminate {
+                let _ = s
+                    .conn
+                    .request_timeout(
+                        "disconnect",
+                        json!({ "restart": false, "terminateDebuggee": s.request == "launch" }),
+                        SHUTDOWN_TIMEOUT,
+                    )
+                    .await;
+            }
+        }
+        if own_terminate && !graceful {
+            // Signal before anything else: waiting on a request the adapter may not answer
+            // would delay the shutdown the console is supposed to show.
+            crate::session::signal_debuggee(s, false).await;
+        }
+        if graceful {
+            // java-debug sends `terminated` only after it has drained the program's console
+            // (it waits up to 5 s for the output pump). Close on the process id alone and the
+            // last shutdown lines are dropped, so wait for that event here.
+            let deadline = std::time::Instant::now() + crate::session::DEBUGGEE_EXIT_WAIT;
+            while !s.terminated.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        // An adapter answers `disconnect` before the program it launched has exited, and that
+        // program keeps its port until it is gone. Reporting the session as terminated then
+        // lets Run start again into an occupied port, so wait for the program first — with the
+        // connection still open, so a second Stop can find the session and kill it.
+        crate::session::wait_for_debuggee(s, terminate).await;
+        if terminate && s.request == "launch" {
+            // The adapter reports `terminated` only after it has drained the program's console
+            // (java-debug waits up to 5 s for the pump): closing before that drops the last
+            // shutdown lines from the console.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while !s.terminated.load(Ordering::Acquire) && !s.conn.is_closed() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        if graceful && !s.conn.is_closed() {
             let _ = s
                 .conn
                 .request_timeout(
                     "disconnect",
-                    json!({ "restart": false, "terminateDebuggee": s.request == "launch" }),
+                    json!({ "restart": false, "terminateDebuggee": false }),
                     SHUTDOWN_TIMEOUT,
                 )
                 .await;
         }
         s.conn.close();
         self.session_closed(s);
+        if s.adapter == "delve" && s.spec.server_host.is_none() {
+            let cwd = s.spec.cwd.clone();
+            tokio::task::spawn_blocking(move || remove_delve_binaries(&cwd));
+        }
     }
 
     /// Breakpoints are kept per file even without a session and sent on start.
@@ -1000,7 +1274,7 @@ impl DebugManager {
         }
         let mut result: Option<Vec<BreakpointState>> = None;
         for s in self.live_sessions() {
-            if !s.configured.load(Ordering::Acquire) || s.conn.is_closed() {
+            if !s.configured.load(Ordering::Acquire) || s.conn.is_closed() || !s.accepts_source_breakpoints(&path) {
                 continue;
             }
             match s.send_breakpoints(&path, &breakpoints, None).await {
@@ -1126,8 +1400,11 @@ impl DebugManager {
     }
 
     pub async fn threads(&self, s: DebugSessionId) -> IdeResult<Vec<ThreadInfo>> {
-        let body = self.session(s)?.conn.request_timeout("threads", Value::Null, REQUEST_TIMEOUT).await?;
-        Ok(body
+        let session = self.session(s)?;
+        // Before sending: a stop that overtakes the reply must not take the reply's ids as its own.
+        let stop = session.suspended.ticket();
+        let body = session.conn.request_timeout("threads", Value::Null, REQUEST_TIMEOUT).await?;
+        let threads: Vec<ThreadInfo> = body
             .get("threads")
             .and_then(Value::as_array)
             .map(|t| {
@@ -1138,11 +1415,16 @@ impl DebugManager {
                     })
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+        if let Some(quirks) = session.kotlin_lsp_quirks() {
+            quirks.saw_threads(stop, threads.iter().map(|t| t.id));
+        }
+        Ok(threads)
     }
 
     pub async fn stack_trace(&self, s: DebugSessionId, thread_id: i64) -> IdeResult<Vec<StackFrame>> {
         let session = self.session(s)?;
+        session.check_thread(thread_id)?;
         let body = session
             .conn
             .request_timeout(
@@ -1151,10 +1433,14 @@ impl DebugManager {
                 REQUEST_TIMEOUT,
             )
             .await?;
+        let kotlin_lsp = session.kotlin_lsp_quirks().is_some();
         let frame = |f: &Value| {
             let mut frame = frame_from(f);
             if let Some(client) = frame.path.as_deref().and_then(|p| session.client_path(&p.to_string_lossy())) {
                 frame.path = Some(client.into());
+            }
+            if kotlin_lsp {
+                frame.name = kotlin_lsp::frame_name(&frame.name).to_owned();
             }
             frame
         };
@@ -1267,8 +1553,15 @@ impl DebugManager {
 
     pub async fn resume(&self, s: DebugSessionId, thread_id: i64) -> IdeResult<()> {
         let session = self.session(s)?;
+        session.check_thread(thread_id)?;
+        if let Some(quirks) = session.kotlin_lsp_quirks() {
+            quirks.resume_sent();
+        }
+        let ticket = session.suspended.ticket();
         let body = session.conn.request_timeout("continue", json!({ "threadId": thread_id }), REQUEST_TIMEOUT).await?;
+        // DAP: a response without the flag continued every thread.
         let all = body.get("allThreadsContinued").and_then(Value::as_bool).unwrap_or(true);
+        session.suspended.resumed(ticket, thread_id, all);
         session.emit(ide_core::event::DebugEvent::Continued { thread_id, all_threads_continued: all });
         Ok(())
     }
@@ -1308,7 +1601,15 @@ impl DebugManager {
             StepKind::Out => "stepOut",
         };
         let session = self.session(s)?;
-        session.conn.request_timeout(command, json!({ "threadId": thread_id }), REQUEST_TIMEOUT).await?;
+        session.check_thread(thread_id)?;
+        if let Some(quirks) = session.kotlin_lsp_quirks() {
+            quirks.step_sent();
+        }
+        let ticket = session.suspended.ticket();
+        let sent = session.conn.request_timeout(command, json!({ "threadId": thread_id }), REQUEST_TIMEOUT).await;
+        step_settled(&session, sent)?;
+        // A step runs its thread; other threads stopped by their own events stay stopped.
+        session.suspended.resumed(ticket, thread_id, false);
         session.emit(ide_core::event::DebugEvent::Continued { thread_id, all_threads_continued: true });
         Ok(())
     }
@@ -1325,6 +1626,11 @@ impl DebugManager {
         force: bool,
     ) -> IdeResult<()> {
         let session = self.session(s)?;
+        // Before touching breakpoints: a refused `continue` would leave them replaced.
+        session.check_thread(thread_id)?;
+        if !session.accepts_source_breakpoints(&path) {
+            return Err(IdeError::unavailable("This debugger cannot set breakpoints in this source file"));
+        }
         if force {
             self.suspend_breakpoints(&session, Some(&path)).await?;
         }
@@ -1344,7 +1650,11 @@ impl DebugManager {
             .breakpoints
             .lock()
             .iter()
-            .filter(|(path, bps)| Some(path.as_path()) != except && bps.iter().any(|b| b.enabled))
+            .filter(|(path, bps)| {
+                Some(path.as_path()) != except
+                    && session.accepts_source_breakpoints(path)
+                    && bps.iter().any(|b| b.enabled)
+            })
             .map(|(path, _)| path.clone())
             .collect();
         let sent = join_all(files.iter().map(|path| session.send_breakpoints(path, &[], None))).await;
@@ -1360,9 +1670,12 @@ impl DebugManager {
         if let Some(e) = failed {
             return Err(e.into());
         }
-        if !self.function_breakpoints.lock().is_empty() && session.supports("supportsFunctionBreakpoints") {
-            session.send_function_breakpoints(&[]).await?;
-            session.pending_restore.lock().functions = true;
+        if session.supports("supportsFunctionBreakpoints") {
+            let _update = session.function_breakpoint_update.lock().await;
+            if !self.function_breakpoints.lock().is_empty() {
+                session.send_function_breakpoints(&[]).await?;
+                session.pending_restore.lock().functions = true;
+            }
         }
         if !self.data_breakpoints.lock().is_empty() && session.supports("supportsDataBreakpoints") {
             session.send_data_breakpoints(&[]).await?;
@@ -1373,19 +1686,23 @@ impl DebugManager {
 
     /// Re-sends what [`suspend_breakpoints`](Self::suspend_breakpoints) / run to cursor replaced.
     pub(crate) async fn restore_breakpoints(&self, session: &Arc<Session>) {
-        let pending = std::mem::take(&mut *session.pending_restore.lock());
+        let pending = {
+            let _update = session.function_breakpoint_update.lock().await;
+            let pending = std::mem::take(&mut *session.pending_restore.lock());
+            if pending.functions || pending.temporary_function.is_some() {
+                let functions = self.function_breakpoints.lock().clone();
+                if let Err(e) = session.send_function_breakpoints(&functions).await {
+                    tracing::debug!("restoring function breakpoints failed: {e}");
+                }
+            }
+            pending
+        };
         let files: Vec<(PathBuf, Vec<Breakpoint>)> =
             pending.files.into_iter().map(|path| (path.clone(), self.stored_breakpoints(&path))).collect();
         let sent = join_all(files.iter().map(|(path, bps)| session.send_breakpoints(path, bps, None))).await;
         for ((path, _), result) in files.iter().zip(sent) {
             if let Err(e) = result {
                 tracing::debug!("restoring breakpoints of {} failed: {e}", path.display());
-            }
-        }
-        if pending.functions {
-            let functions = self.function_breakpoints.lock().clone();
-            if let Err(e) = session.send_function_breakpoints(&functions).await {
-                tracing::debug!("restoring function breakpoints failed: {e}");
             }
         }
         if pending.data {
@@ -1399,6 +1716,7 @@ impl DebugManager {
     /// Force Step Over: `next` with every breakpoint suspended until the step ends.
     pub async fn force_step_over(&self, s: DebugSessionId, thread_id: i64) -> IdeResult<()> {
         let session = self.session(s)?;
+        session.check_thread(thread_id)?;
         self.suspend_breakpoints(&session, None).await?;
         self.step(s, thread_id, StepKind::Over).await
     }
@@ -1406,12 +1724,52 @@ impl DebugManager {
     /// Step into a specific call of the current line (Smart Step Into).
     pub async fn step_in_target(&self, s: DebugSessionId, thread_id: i64, target_id: i64) -> IdeResult<()> {
         let session = self.session(s)?;
-        session
+        session.check_thread(thread_id)?;
+        if let Some(quirks) = session.kotlin_lsp_quirks() {
+            quirks.step_sent();
+        }
+        let ticket = session.suspended.ticket();
+        let sent = session
             .conn
             .request_timeout("stepIn", json!({ "threadId": thread_id, "targetId": target_id }), REQUEST_TIMEOUT)
-            .await?;
+            .await;
+        step_settled(&session, sent)?;
+        session.suspended.resumed(ticket, thread_id, false);
         session.emit(ide_core::event::DebugEvent::Continued { thread_id, all_threads_continued: true });
         Ok(())
+    }
+
+    /// NetCoreDbg has no target-aware stepIn. A temporary method breakpoint plus
+    /// step over stops at the chosen call or at the next sequence point if it is skipped.
+    pub async fn step_into_function(&self, s: DebugSessionId, thread_id: i64, name: String) -> IdeResult<()> {
+        let session = self.session(s)?;
+        if session.adapter != "netcoredbg" || !session.supports("supportsFunctionBreakpoints") {
+            return Err(IdeError::unavailable("The debugger cannot step into a function by name"));
+        }
+        session.check_thread(thread_id)?;
+        let _update = session.function_breakpoint_update.lock().await;
+        if session.pending_restore.lock().temporary_function.is_some() {
+            return Err(IdeError::invalid("A targeted step is already in progress"));
+        }
+        let stored = self.function_breakpoints.lock().clone();
+        let sent = with_temporary_function(&stored, &name);
+        let attempt = async {
+            let states = session.send_function_breakpoints(&sent).await?;
+            if !states.last().is_some_and(|state| state.verified) {
+                return Err(IdeError::unavailable(format!("Cannot resolve the function breakpoint for {name}")));
+            }
+            session.pending_restore.lock().temporary_function = Some(name);
+            self.step(s, thread_id, StepKind::Over).await
+        }
+        .await;
+        if attempt.is_err() {
+            session.pending_restore.lock().temporary_function = None;
+            if let Err(e) = session.send_function_breakpoints(&stored).await {
+                tracing::debug!("restoring function breakpoints failed: {e}");
+                session.pending_restore.lock().functions = true;
+            }
+        }
+        attempt
     }
 
     /// Calls on the current line of `frame_id` that can be stepped into.
@@ -1443,10 +1801,68 @@ impl DebugManager {
     }
 
     pub fn capabilities(&self, s: DebugSessionId) -> IdeResult<DebugCapabilities> {
+        Ok(session_capabilities(&*self.session(s)?))
+    }
+
+    /// Class table of the session's JVM (`GC.class_histogram -all`, or counted by the debugger
+    /// while suspended where no histogram can be taken), with deltas against the session's
+    /// previous snapshot from the same source.
+    pub async fn jvm_memory_classes(&self, s: DebugSessionId) -> IdeResult<JvmMemoryResult> {
         let session = self.session(s)?;
-        let mut caps = capabilities_from(&session.caps.lock());
-        caps.hot_code_replace = HOT_CODE_REPLACE_ADAPTERS.contains(&session.adapter.as_str());
-        Ok(caps)
+        jvm_memory::session_classes(session).await
+    }
+
+    /// Writes a heap dump of the session's JVM to `dir/dump.hprof`, one class-table or dump
+    /// request per session at a time. Anything but `Ready` deletes `dir`, unless `s` is not a
+    /// session. On `cancel` the result is `Cancelled` at once, while a dump the JVM is writing
+    /// still holds the session's turn until the JVM answers.
+    pub async fn jvm_heap_dump(
+        &self,
+        s: DebugSessionId,
+        dir: PathBuf,
+        cancel: ide_core::CancellationToken,
+    ) -> IdeResult<JvmHeapOutcome> {
+        let session = self.session(s)?;
+        jvm_memory::session_heap_dump(session, dir, cancel).await
+    }
+
+    /// Gives the session the backend for [`Self::jvm_memory_instances`] and the debugger's class
+    /// counts; the UI is told to reload the session's capabilities.
+    pub fn set_jvm_inspector(
+        &self,
+        s: DebugSessionId,
+        inspector: Arc<dyn ide_jvm_inspect::JvmInspector>,
+    ) -> IdeResult<()> {
+        let session = self.session(s)?;
+        if session.ended.is_cancelled() {
+            return Err(no_session(s));
+        }
+        jvm_memory::set_inspector(&session, inspector);
+        Ok(())
+    }
+
+    /// Up to `limit` (clamped to `1..=MAX_INSTANCES`) instances of `class_name` while suspended.
+    pub async fn jvm_memory_instances(
+        &self,
+        s: DebugSessionId,
+        class_name: String,
+        limit: u32,
+    ) -> IdeResult<JvmInstancesResult> {
+        jvm_memory::instances(&*self.session(s)?, &class_name, limit).await
+    }
+
+    pub async fn jvm_memory_fields(&self, s: DebugSessionId, object: JvmObjectRef) -> IdeResult<JvmFieldsResult> {
+        jvm_memory::fields(&*self.session(s)?, object).await
+    }
+
+    /// Objects that point at `object`; `limit` 0 means `DEFAULT_REFERRERS`, at most `MAX_REFERRERS`.
+    pub async fn jvm_memory_referrers(
+        &self,
+        s: DebugSessionId,
+        object: JvmObjectRef,
+        limit: u32,
+    ) -> IdeResult<JvmReferrersResult> {
+        jvm_memory::referrers(&*self.session(s)?, object, limit).await
     }
 
     /// HotSwap: reloads the classes compiled since the session started (or since the
@@ -1473,9 +1889,17 @@ impl DebugManager {
             {
                 continue;
             }
-            match s.send_function_breakpoints(&list).await {
-                Ok(states) => {
-                    result.get_or_insert(states);
+            let _update = s.function_breakpoint_update.lock().await;
+            let stored = self.function_breakpoints.lock().clone();
+            let temporary = s.pending_restore.lock().temporary_function.clone();
+            let sent =
+                temporary.as_deref().map_or_else(|| stored.clone(), |name| with_temporary_function(&stored, name));
+            match s.send_function_breakpoints(&sent).await {
+                Ok(mut states) => {
+                    states.truncate(stored.len());
+                    if stored == list {
+                        result.get_or_insert(states);
+                    }
                 }
                 Err(e) => tracing::debug!("setFunctionBreakpoints on session {} failed: {e}", s.id.0),
             }
@@ -1545,11 +1969,43 @@ impl DebugManager {
         }
     }
 
-    /// Stops a session and its child sessions.
+    /// Stops every debug session started from `root` or below — closing a project stops the
+    /// programs it launched even when the session's owner key does not name the window doing
+    /// the closing (window groups, auxiliary windows).
+    pub async fn stop_under(&self, root: &Path) {
+        let ids: Vec<DebugSessionId> =
+            self.live_sessions().into_iter().filter(|s| s.spec.cwd.starts_with(root)).map(|s| s.id).collect();
+        tracing::info!(root = %root.display(), sessions = ids.len(), "closing project: stopping debug sessions");
+        for id in ids {
+            if let Err(e) = self.stop(id).await {
+                tracing::debug!("debug session {id:?} did not stop: {e}");
+            }
+        }
+    }
+
+    /// Stops a session and its child sessions. A second Stop while the first one waits kills
+    /// the program instead of waiting for it — even after the adapter dropped the session.
     pub async fn stop(&self, s: DebugSessionId) -> IdeResult<()> {
+        {
+            let in_flight = self.stopping.lock();
+            if let Some(session) = in_flight.get(&s) {
+                session.stop_force.store(true, Ordering::Release);
+                return Ok(());
+            }
+        }
         let session = self.session(s)?;
-        let children: Vec<Arc<Session>> = self.live_sessions().into_iter().filter(|c| c.parent == Some(s)).collect();
+        self.stopping.lock().insert(s, session.clone());
+        let result = self.stop_tree(session).await;
+        self.stopping.lock().remove(&s);
+        result
+    }
+
+    async fn stop_tree(&self, session: Arc<Session>) -> IdeResult<()> {
+        session.startup_cancel.cancel();
+        let children: Vec<Arc<Session>> =
+            self.live_sessions().into_iter().filter(|c| c.parent == Some(session.id)).collect();
         for child in children {
+            child.startup_cancel.cancel();
             self.shutdown(&child, true).await;
         }
         self.shutdown(&session, true).await;

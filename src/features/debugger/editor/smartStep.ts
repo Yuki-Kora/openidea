@@ -7,11 +7,13 @@
 import { RangeSetBuilder, type Extension } from "@codemirror/state";
 import { Decoration, EditorView, ViewPlugin, type DecorationSet } from "@codemirror/view";
 import { editorsFor, activeEditor, type EditorDocContext, type TextEditorHandle } from "@/editor/api";
-import { call, commands, type DebugSessionId, type StepInTarget } from "@/platform/ipc";
+import { call, commands, nextRequestId, type DebugSessionId, type StackFrame, type StepInTarget } from "@/platform/ipc";
+import { virtualName } from "@/platform/virtualDocs";
+import { tx } from "@/platform/i18n";
 import { suspendKeyboardDispatch } from "@/platform/keymap";
 import { notifications } from "@/workbench/contributions";
-import { useExecutionPoint, resumeExecution } from "../state";
-import { useOverlays, type InlineStepTarget } from "../ui/popoverStore";
+import { activeSession, useDebug, useExecutionPoint, resumeExecution } from "../state";
+import { useOverlays, type InlineStepTarget, type SmartStepTarget } from "../ui/popoverStore";
 import styles from "./editor.module.css";
 
 const IDENT = /[\p{L}\p{N}_$]/u;
@@ -95,6 +97,57 @@ export function pausedLineTargets(targets: StepInTarget[]): StepInTarget[] {
   return doc && line < doc.lines ? targetsOnLine(doc.line(line + 1).text, line, targets) : targets;
 }
 
+/** NetCoreDbg's function breakpoints use CLR method names, including property getters. */
+async function managedFunctionName(doc: number, line: number, col: number, label: string, property: boolean) {
+  const [hover, definitions] = await Promise.all([
+    call(commands.lspHover(nextRequestId(), doc, { line, col })),
+    call(commands.lspGoto(doc, { line, col }, "definition")),
+  ]);
+  if (!hover || definitions.length !== 1) return null;
+  const signature = hover.contents.value.split("\n").find((text) => text.includes(`.${label}`));
+  const prefix = signature?.slice(0, signature.indexOf(`.${label}`));
+  const owner = prefix?.match(/[\p{L}_][\p{L}\p{N}_.]*$/u)?.[0];
+  if (!owner) return null;
+  const uri = definitions[0]?.uri;
+  const decompiled = uri?.startsWith("csharp:") ? virtualName(uri).replace(/\.cs$/, "") : null;
+  return `${decompiled ?? owner}.${property ? "get_" : ""}${label}`;
+}
+
+/** Resolve methods and properties on the stopped C# line using the language server. */
+export async function managedStepTargets(frame: StackFrame): Promise<SmartStepTarget[]> {
+  const editor = frame.path && editorShowing(frame.path);
+  if (!editor || editor.ctx.language !== "csharp" || frame.line >= editor.view.state.doc.lines) return [];
+  const text = editor.view.state.doc.line(frame.line + 1).text;
+  const doc = editor.ctx.doc;
+  const tokens = await call(commands.lspSemanticTokens(doc)).catch(() => null);
+  if (!tokens) return [];
+  const candidates: Array<{ column: number; endColumn: number; property: boolean }> = [];
+  for (let i = 0; i < tokens.data.length; i += 5) {
+    if (tokens.data[i] !== frame.line) continue;
+    const kind = tokens.tokenTypes[tokens.data[i + 3]!];
+    if (kind !== "method" && kind !== "property") continue;
+    const column = tokens.data[i + 1]!;
+    const endColumn = column + tokens.data[i + 2]!;
+    if (kind === "property" && /^\s*(?:=(?!=)|[+*/%&|^-]=|\?\?=)/.test(text.slice(endColumn))) continue;
+    candidates.push({ column, endColumn, property: kind === "property" });
+  }
+  if (candidates.length < 2) return [];
+  const targets = await Promise.all(
+    candidates.map(async ({ column, endColumn, property }, id) => {
+      const label = text.slice(column, endColumn);
+      const functionName = await managedFunctionName(doc, frame.line, column, label, property).catch(() => null);
+      return functionName
+        ? { id, label: property ? label : `${label}()`, line: frame.line, column, endColumn, functionName }
+        : null;
+    }),
+  );
+  const resolved = targets.filter((target) => target !== null);
+  // Function breakpoints cannot distinguish repeated invocations of the same method on one line.
+  const counts = new Map<string, number>();
+  for (const { functionName } of resolved) counts.set(functionName, (counts.get(functionName) ?? 0) + 1);
+  return resolved.filter(({ functionName }) => counts.get(functionName) === 1);
+}
+
 /** Editor to pick in: the active one when it shows `path`, else any showing it. */
 function editorShowing(path: string): TextEditorHandle | null {
   const active = activeEditor();
@@ -106,7 +159,7 @@ function editorShowing(path: string): TextEditorHandle | null {
  * Starts inline picking when the paused line is open in an editor and every
  * target can be placed on it; returns false otherwise (caller shows the dialog).
  */
-export function startInlineSmartStep(session: DebugSessionId, thread: number, targets: StepInTarget[]): boolean {
+export function startInlineSmartStep(session: DebugSessionId, thread: number, targets: SmartStepTarget[]): boolean {
   const { path, line, top } = useExecutionPoint.getState();
   if (!path || !top) return false;
   const editor = editorShowing(path);
@@ -116,7 +169,13 @@ export function startInlineSmartStep(session: DebugSessionId, thread: number, ta
   if (!ranges || ranges.length < 2) return false;
   const first = ranges.findIndex((r) => r.id === targets[0]!.id);
   useOverlays.setState({
-    smartStep: { session, thread, targets, inline: { path, line, ranges, index: Math.max(0, first) } },
+    smartStep: {
+      session,
+      thread,
+      targets,
+      stopSeq: useDebug.getState().stopSeq,
+      inline: { path, line, ranges, index: Math.max(0, first) },
+    },
   });
   editor.view.focus();
   return true;
@@ -137,14 +196,21 @@ function selectStepTarget(index: number) {
 export function chooseStepTarget(id?: number) {
   const s = useOverlays.getState().smartStep;
   if (!s) return;
-  const target = id ?? s.inline?.ranges[s.inline.index]?.id;
+  const targetId = id ?? s.inline?.ranges[s.inline.index]?.id;
+  const target = s.targets.find((t) => t.id === targetId);
   cancelSmartStep();
-  if (target == null) return;
-  void resumeExecution(s.session, () => call(commands.debugStepInTarget(s.session, s.thread, target))).catch((e) =>
+  if (!target || activeSession()?.id !== s.session || useDebug.getState().stopSeq !== s.stopSeq) return;
+  void resumeExecution(s.session, () =>
+    call(
+      target.functionName
+        ? commands.debugStepIntoFunction(s.session, s.thread, target.functionName)
+        : commands.debugStepInTarget(s.session, s.thread, target.id),
+    ),
+  ).catch((e) =>
     notifications().notify({
       group: "run",
       level: "error",
-      title: "Smart Step Into failed",
+      title: tx("Smart Step Into failed"),
       body: e instanceof Error ? e.message : String(e),
     }),
   );
@@ -214,9 +280,22 @@ export function installSmartStepPicking(target: Window = window): () => void {
     }
   };
   const unsub = useOverlays.subscribe(sync);
+  const unsubDebug = useDebug.subscribe((state) => {
+    const step = useOverlays.getState().smartStep;
+    if (
+      step &&
+      (state.active !== step.session ||
+        state.stopSeq !== step.stopSeq ||
+        state.sessions[step.session]?.status !== "paused" ||
+        (state.sessions[step.session]?.selectedThread ?? state.sessions[step.session]?.stoppedThread) !== step.thread)
+    ) {
+      cancelSmartStep();
+    }
+  });
   sync();
   return () => {
     unsub();
+    unsubDebug();
     teardown?.();
     teardown = null;
   };

@@ -4,6 +4,7 @@
  * no binding so switching presets doesn't leak IntelliJ shortcuts.
  */
 export const vscodeMacos: Record<string, string[]> = {
+  "editor.addOrRemoveCaret": ["Alt+Shift+Button1"],
   // Navigate
   "navigate.searchEverywhere": ["Shift Shift"],
   "navigate.gotoClass": [],
@@ -15,8 +16,8 @@ export const vscodeMacos: Record<string, string[]> = {
   "navigate.switcherBack": ["Ctrl+Shift+Tab"],
   "navigate.recentFiles": [],
   "navigate.recentLocations": [],
-  "navigate.back": ["Ctrl+-", "Button4"],
-  "navigate.forward": ["Ctrl+Shift+-", "Button5"],
+  "navigate.back": ["Ctrl+-", "Button4", "SwipeRight"],
+  "navigate.forward": ["Ctrl+Shift+-", "Button5", "SwipeLeft"],
   "navigate.gotoLine": ["Ctrl+G"],
   "navigate.declaration": ["F12"],
   "navigate.implementation": ["Meta+F12"],
@@ -182,6 +183,7 @@ export const vscodeMacos: Record<string, string[]> = {
   "file.save": ["Meta+S"],
   "file.new": ["Meta+N"],
   "file.settings": ["Meta+,"],
+  "file.projectStructure": [],
   "file.openProject": ["Meta+O"],
   "file.newScratchFile": [],
   "editor.closeTab": ["Meta+W"],
@@ -298,6 +300,8 @@ export const vscodeMacos: Record<string, string[]> = {
   "vcs.rollback": [],
   "vcs.addToVcs": [],
   "vcs.showDiff": [],
+  "vcs.log.changes.showDiff": [],
+  "vcs.showDiffInNewWindow": [],
   "vcs.nextChange": ["Alt+F5"],
   "vcs.prevChange": ["Alt+Shift+F5"],
   "vcs.branches": [],
@@ -322,6 +326,7 @@ export const vscodeMacos: Record<string, string[]> = {
   "code.cyclicExpandWord": [],
   "code.cyclicExpandWordBackward": [],
   "editor.copyReference": [],
+  "editor.copyPathReference": [],
   "code.pasteAsPlainText": [],
   "code.expressionTypeInfo": [],
   "code.implementMethods": [],
@@ -347,6 +352,12 @@ export const vscodeMacos: Record<string, string[]> = {
   "http.runRequest": ["Meta+Enter"],
   "graphql.runQuery": ["Meta+Enter"],
   "http.runAll": [],
+  "db.toggleBooleanCell": ["Space"],
+  "db.setCellNull": ["Meta+Backspace"],
+  "db.setCellDefault": ["Meta+Shift+Backspace"],
+  "db.reformatValue": ["Alt+Shift+F"],
+  "db.openValueWindow": [],
+  "db.findInValue": ["Meta+F"],
   "db.execute": ["Meta+Enter"],
   "db.showToolWindow": [],
   // Database tool window (when the tree has focus).
@@ -393,4 +404,6 @@ export const vscodeMacos: Record<string, string[]> = {
   "find.openInWindow": ["Alt+F7"],
   "find.field.newLine": ["Meta+Shift+Enter"],
   "find.field.recentSearches": ["Alt+Down"],
+  "editor.pasteHistory.paste": ["Enter"],
+  "editor.pasteHistory.remove": ["Delete", "Backspace"],
 };
