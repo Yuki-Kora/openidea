@@ -12,6 +12,10 @@ const ipc = vi.hoisted(() => {
     debugResume: vi.fn(() => ok(null)),
     debugForceStepOver: vi.fn(() => ok(null)),
     debugRunTo: vi.fn(() => ok(null)),
+    debugStepIntoFunction: vi.fn(() => ok(null)),
+    lspSemanticTokens: vi.fn(() => ok(null as import("@/platform/ipc").SemanticTokens | null)),
+    lspHover: vi.fn(() => ok(null as { contents: { kind: "markdown"; value: string }; range: null } | null)),
+    lspGoto: vi.fn(() => ok([] as import("@/platform/ipc").Location[])),
     debugStepInTargets: vi.fn(() => ok([] as Array<{ id: number; label: string }>)),
     debugStepInTarget: vi.fn(() => ok(null)),
     debugRestartFrame: vi.fn(() => ok(null)),
@@ -88,6 +92,7 @@ import { breakpointsOf, loadBreakpoints, toggleBreakpoint } from "../breakpoints
 import { loadSpecialBreakpoints, removeAllSpecial, useSpecialBreakpoints } from "../breakpoints/special";
 import { publishContext, updateExecutionPoint, useExecutionPoint, useDebug, type DebugSession } from "../state";
 import { focusDebugView, blurDebugView } from "../ui/focusedView";
+import { chooseStepTarget } from "../editor/smartStep";
 import { useOverlays } from "../ui/popoverStore";
 import { forgetMemory, selectMemoryClass } from "../memory/memoryState";
 import { forgetInstances, setInstancesLead, showInstances, useInstances } from "../memory/instancesState";
@@ -261,6 +266,37 @@ describe("debugger actions (IDEA parity)", () => {
     await executeAction("debug.smartStepInto");
     await settle();
     expect(ipc.debugStep).toHaveBeenCalledWith(3, 1, "into");
+  });
+
+  it("offers both C# getters on F11 and runs only the selected target", async () => {
+    const path = "/p/App.cs";
+    const text = "if (obj is { First: true } && obj.Second) {}";
+    const frame = { id: 70, name: "Main", path, line: 0, column: 0, presentationHint: null };
+    paused({ adapter: "netcoredbg", caps: caps({ functionBreakpoints: true }), frames: [frame], selectedFrame: 70 });
+    caret(path, "csharp", text, 0);
+    ipc.lspSemanticTokens.mockReturnValueOnce(
+      ipc.ok({
+        data: [0, text.indexOf("First"), 5, 0, 0, 0, text.indexOf("Second"), 6, 0, 0],
+        tokenTypes: ["property"],
+        tokenModifiers: [],
+      }),
+    );
+    const range = { start: { line: 3, col: 4 }, end: { line: 3, col: 10 } };
+    ipc.lspGoto.mockReturnValue(ipc.ok([{ path: "/p/Gate.cs", range }]));
+    ipc.lspHover
+      .mockReturnValueOnce(ipc.ok({ contents: { kind: "markdown", value: "bool Gate.First" }, range: null }))
+      .mockReturnValueOnce(ipc.ok({ contents: { kind: "markdown", value: "bool Gate.Second" }, range: null }));
+    const focus = vi.fn();
+    Object.assign(editor.current!.view, { focus });
+    await executeAction("debug.stepInto");
+    await settle();
+    expect(useOverlays.getState().smartStep?.targets.map((t) => t.label)).toEqual(["First", "Second"]);
+    expect(useDebug.getState().sessions[3]?.status).toBe("paused");
+    expect(ipc.debugStep).not.toHaveBeenCalled();
+
+    chooseStepTarget(1);
+    expect(ipc.debugStepIntoFunction).toHaveBeenCalledWith(3, 1, "Gate.get_Second");
+    expect(useOverlays.getState().smartStep).toBeNull();
   });
 
   it("Reset Frame restarts the selected frame when the adapter can", async () => {

@@ -367,6 +367,16 @@ pub async fn debug_step_in_target(
     host.debugger.step_in_target(session, thread_id, target_id).await
 }
 
+pub async fn debug_step_into_function(
+    host: &Host,
+    _window: &str,
+    session: DebugSessionId,
+    thread_id: i64,
+    name: String,
+) -> IdeResult<()> {
+    host.debugger.step_into_function(session, thread_id, name).await
+}
+
 /// Reset Frame (Drop Frame).
 pub async fn debug_restart_frame(host: &Host, _window: &str, session: DebugSessionId, frame_id: i64) -> IdeResult<()> {
     host.debugger.restart_frame(session, frame_id).await
@@ -580,6 +590,9 @@ pub(crate) fn register(d: &mut Dispatcher) {
     });
     d.add("debug_step_in_targets", |c| async move {
         debug_step_in_targets(&c.host, &c.window, c.arg("session")?, c.arg("frameId")?).await
+    });
+    d.add("debug_step_into_function", |c| async move {
+        debug_step_into_function(&c.host, &c.window, c.arg("session")?, c.arg("threadId")?, c.arg("name")?).await
     });
     d.add("debug_step_in_target", |c| async move {
         debug_step_in_target(&c.host, &c.window, c.arg("session")?, c.arg("threadId")?, c.arg("targetId")?).await

@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, watch};
 pub(crate) struct PendingRestore {
     pub files: BTreeSet<PathBuf>,
     pub functions: bool,
+    pub temporary_function: Option<String>,
     pub data: bool,
 }
 
@@ -82,6 +83,7 @@ pub(crate) struct Session {
     pub stop_tree: Mutex<Option<ide_core::process::ProcessTree>>,
     /// Breakpoints replaced for run to cursor / force stepping, restored on the next stop.
     pub pending_restore: Mutex<PendingRestore>,
+    pub function_breakpoint_update: tokio::sync::Mutex<()>,
     /// Adapter breakpoint id → (file, index in the stored list).
     pub breakpoint_ids: Mutex<HashMap<i64, (PathBuf, usize)>>,
     /// Resolved path → the path as the IDE knows it, for adapters given resolved paths.
@@ -244,6 +246,7 @@ impl Session {
             #[cfg(windows)]
             stop_tree: Mutex::new(None),
             pending_restore: Mutex::default(),
+            function_breakpoint_update: tokio::sync::Mutex::default(),
             breakpoint_ids: Mutex::new(HashMap::new()),
             resolved_paths: Mutex::new(HashMap::new()),
             progress: Mutex::new(HashMap::new()),
@@ -320,6 +323,14 @@ impl Session {
 
     pub fn supports(&self, cap: &str) -> bool {
         self.caps.lock().get(cap).and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    pub fn accepts_source_breakpoints(&self, path: &Path) -> bool {
+        let managed = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cs") || ext.eq_ignore_ascii_case("csx"));
+        !managed || !matches!(self.adapter.as_str(), "lldb-dap" | "codelldb")
     }
 
     /// Sends the breakpoints of one file (disabled ones omitted, plus an optional

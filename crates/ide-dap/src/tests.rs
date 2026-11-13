@@ -1351,6 +1351,32 @@ async fn smart_step_into_and_reset_frame() {
 }
 
 #[tokio::test]
+async fn netcoredbg_targeted_step_restores_function_breakpoints_on_the_next_stop() {
+    let h = harness(Script::default());
+    let cfg = LaunchConfig { adapter: "netcoredbg".into(), ..config() };
+    let id = h.start(cfg).await.unwrap();
+    h.wait_event(|e| matches!(e, DebugEvent::Stopped { .. })).await;
+    let mut existing = function_bp("Gate.get_First", true);
+    existing.condition = Some("check".into());
+    h.manager.set_function_breakpoints(vec![existing]).await.unwrap();
+
+    h.manager.step_into_function(id, 1, "Gate.get_First".into()).await.unwrap();
+    h.wait_event(|e| matches!(e, DebugEvent::Stopped { reason, .. } if reason == "step")).await;
+    let calls = requests(&h, "setFunctionBreakpoints");
+    assert_eq!(calls[calls.len() - 2]["breakpoints"], json!([{"name": "Gate.get_First"}]));
+    assert_eq!(calls.last().unwrap()["breakpoints"], json!([{"name": "Gate.get_First", "condition": "check"}]));
+    assert_eq!(h.request("next")["arguments"], json!({"threadId": 1}));
+
+    assert!(h.manager.step_into_function(id, 1, "missing".into()).await.is_err());
+    assert_eq!(requests(&h, "next").len(), 1);
+    assert_eq!(
+        requests(&h, "setFunctionBreakpoints").last().unwrap()["breakpoints"],
+        json!([{"name": "Gate.get_First", "condition": "check"}])
+    );
+    h.manager.stop(id).await.unwrap();
+}
+
+#[tokio::test]
 async fn force_stepping_suspends_breakpoints_until_the_next_stop() {
     let h = harness(Script::default());
     let a = PathBuf::from("/p/a.py");
@@ -1404,6 +1430,35 @@ async fn startup_sends_every_file_at_once_and_skips_files_with_nothing_enabled()
         h.manager.breakpoint_states(&off),
         [BreakpointState { line: 5, verified: false, message: Some("Disabled".into()) }]
     );
+}
+
+#[tokio::test]
+async fn managed_source_breakpoints_bypass_native_debuggers() {
+    let h = harness(Script::default());
+    let cs = PathBuf::from("/p/Player.CS");
+    let cpp = PathBuf::from("/p/Player.cpp");
+    h.manager.set_breakpoints(cs.clone(), vec![bp(3)]).await.unwrap();
+    h.manager.set_breakpoints(cpp.clone(), vec![bp(6)]).await.unwrap();
+
+    for adapter in ["lldb-dap", "codelldb"] {
+        let native = LaunchConfig { adapter: adapter.into(), request: "attach".into(), ..config() };
+        let id = h.start(native).await.unwrap();
+        h.manager.set_breakpoints(cs.clone(), vec![bp(5)]).await.unwrap();
+        assert!(h.manager.run_to(id, 1, cs.clone(), 8, true).await.is_err());
+        h.manager.stop(id).await.unwrap();
+    }
+
+    let sent = || requests(&h, "setBreakpoints");
+    let has_cs = |request: &Value| request["source"]["name"] == "Player.CS";
+    assert!(sent().iter().all(|request| !has_cs(request)));
+    assert_eq!(sent().iter().filter(|request| request["source"]["name"] == "Player.cpp").count(), 2);
+
+    let managed = LaunchConfig { adapter: "netcoredbg".into(), ..config() };
+    let id = h.start(managed).await.unwrap();
+    let requests = sent();
+    let request = requests.iter().find(|request| has_cs(request)).expect("managed breakpoint was preserved");
+    assert_eq!(request["breakpoints"], json!([{"line": 6}]));
+    h.manager.stop(id).await.unwrap();
 }
 
 #[tokio::test]

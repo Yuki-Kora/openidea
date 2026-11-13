@@ -3,6 +3,8 @@
  * attach request each debugger needs, like IDEA's `XAttachDebuggerProvider`s.
  */
 import { workflowSettings } from "@/platform/workflowSettings";
+import { tx } from "@/platform/i18n";
+import { hostOs } from "@/platform/remote";
 import type { AttachKind, AttachableProcess, LaunchConfig } from "@/platform/ipc";
 import { javaAttachConfig } from "./java";
 
@@ -11,10 +13,11 @@ export const KIND_LABELS: Record<AttachKind, string> = {
   node: "Node.js",
   python: "Python (debugpy)",
   go: "Go (Delve)",
+  dotnet: ".NET (netcoredbg)",
   native: "Native (LLDB)",
 };
 
-const KIND_ORDER: AttachKind[] = ["java", "node", "python", "go", "native"];
+const KIND_ORDER: AttachKind[] = ["java", "node", "python", "go", "dotnet", "native"];
 
 export type AttachRow =
   | { kind: "group"; key: string; label: string; count: number }
@@ -34,7 +37,12 @@ export function attachRows(list: readonly AttachableProcess[], filter: string): 
   for (const kind of KIND_ORDER) {
     const items = list.filter((p) => p.kind === kind && matchesFilter(p, filter));
     if (!items.length) continue;
-    rows.push({ kind: "group", key: `group:${kind}`, label: KIND_LABELS[kind], count: items.length });
+    rows.push({
+      kind: "group",
+      key: `group:${kind}`,
+      label: kind === "dotnet" ? tx(".NET (netcoredbg)") : KIND_LABELS[kind],
+      count: items.length,
+    });
     for (const p of items) rows.push({ kind: "process", key: `${kind}:${p.pid}`, process: p });
   }
   return rows;
@@ -86,7 +94,20 @@ export async function attachConfig(p: AttachableProcess, root: string): Promise<
       );
     case "go":
       return base(p, root, { mode: "local", processId: p.pid });
+    case "dotnet":
+      return base(p, root, { processId: p.pid });
     case "native":
+      if (p.adapter === "lldb-dap" && hostOs() === "windows" && p.name.toLowerCase() === "unrealeditor.exe") {
+        // Unreal loads enough DLLs for eager symbol loading to time out during attach.
+        return base(p, root, {
+          pid: p.pid,
+          initCommands: [
+            "settings set target.preload-symbols false",
+            "settings set symbols.load-on-demand true",
+            "settings set target.load-script-from-symbol-file false",
+          ],
+        });
+      }
       return base(p, root, { pid: p.pid });
   }
 }

@@ -358,6 +358,7 @@
   "Overwrite existing branch": "Overwrite existing branch",
   "Unset upstream branch": "Unset upstream branch",
   "Branch '{n}' already exists": "Branch '{n}' already exists",
+  ".NET (netcoredbg)": ".NET (netcoredbg)",
   "Cannot copy reference": "Cannot copy reference",
   "Decompiled assembly (read-only).": "Decompiled assembly (read-only).",
   "Connect through:": "Connect through:",

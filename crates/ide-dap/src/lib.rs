@@ -554,6 +554,17 @@ pub(crate) fn enabled_filters(
         .collect()
 }
 
+fn with_temporary_function(stored: &[FunctionBreakpoint], name: &str) -> Vec<FunctionBreakpoint> {
+    let mut sent = stored.to_vec();
+    for bp in &mut sent {
+        if bp.name == name {
+            bp.enabled = false;
+        }
+    }
+    sent.push(FunctionBreakpoint { name: name.to_owned(), condition: None, hit_condition: None, enabled: true });
+    sent
+}
+
 pub(crate) fn step_in_target_from(t: &Value) -> StepInTarget {
     let num = |k: &str| t.get(k).and_then(Value::as_u64).map(|n| (n as u32).saturating_sub(1));
     StepInTarget {
@@ -1100,15 +1111,15 @@ impl DebugManager {
             .lock()
             .iter()
             .map(|(p, b)| (p.clone(), b.clone()))
-            .partition(|(_, b)| b.iter().any(|b| b.enabled));
+            .partition(|(path, b)| s.accepts_source_breakpoints(path) && b.iter().any(|b| b.enabled));
         let sent = join_all(files.iter().map(|(path, bps)| s.send_breakpoints(path, bps, None))).await;
-        // Breakpoint states follow the owner's first session.
-        let first = self.live_sessions().into_iter().find(|f| f.owner.key == s.owner.key).map(|f| f.id) == Some(s.id);
+        // Breakpoint states follow the owner's first session that accepts the source.
+        let owner_sessions: Vec<_> = self.live_sessions().into_iter().filter(|f| f.owner.key == s.owner.key).collect();
         let idle = idle.into_iter().map(|(path, bps)| (path, Ok(unsent(&bps))));
         for (path, result) in files.into_iter().map(|(path, _)| path).zip(sent).chain(idle) {
             match result {
                 Ok(states) => {
-                    if first {
+                    if owner_sessions.iter().find(|f| f.accepts_source_breakpoints(&path)).map(|f| f.id) == Some(s.id) {
                         self.states.lock().insert(path.clone(), states);
                         s.emit(ide_core::event::DebugEvent::BreakpointsChanged { path: path.into() });
                     }
@@ -1263,7 +1274,7 @@ impl DebugManager {
         }
         let mut result: Option<Vec<BreakpointState>> = None;
         for s in self.live_sessions() {
-            if !s.configured.load(Ordering::Acquire) || s.conn.is_closed() {
+            if !s.configured.load(Ordering::Acquire) || s.conn.is_closed() || !s.accepts_source_breakpoints(&path) {
                 continue;
             }
             match s.send_breakpoints(&path, &breakpoints, None).await {
@@ -1617,6 +1628,9 @@ impl DebugManager {
         let session = self.session(s)?;
         // Before touching breakpoints: a refused `continue` would leave them replaced.
         session.check_thread(thread_id)?;
+        if !session.accepts_source_breakpoints(&path) {
+            return Err(IdeError::unavailable("This debugger cannot set breakpoints in this source file"));
+        }
         if force {
             self.suspend_breakpoints(&session, Some(&path)).await?;
         }
@@ -1636,7 +1650,11 @@ impl DebugManager {
             .breakpoints
             .lock()
             .iter()
-            .filter(|(path, bps)| Some(path.as_path()) != except && bps.iter().any(|b| b.enabled))
+            .filter(|(path, bps)| {
+                Some(path.as_path()) != except
+                    && session.accepts_source_breakpoints(path)
+                    && bps.iter().any(|b| b.enabled)
+            })
             .map(|(path, _)| path.clone())
             .collect();
         let sent = join_all(files.iter().map(|path| session.send_breakpoints(path, &[], None))).await;
@@ -1652,9 +1670,12 @@ impl DebugManager {
         if let Some(e) = failed {
             return Err(e.into());
         }
-        if !self.function_breakpoints.lock().is_empty() && session.supports("supportsFunctionBreakpoints") {
-            session.send_function_breakpoints(&[]).await?;
-            session.pending_restore.lock().functions = true;
+        if session.supports("supportsFunctionBreakpoints") {
+            let _update = session.function_breakpoint_update.lock().await;
+            if !self.function_breakpoints.lock().is_empty() {
+                session.send_function_breakpoints(&[]).await?;
+                session.pending_restore.lock().functions = true;
+            }
         }
         if !self.data_breakpoints.lock().is_empty() && session.supports("supportsDataBreakpoints") {
             session.send_data_breakpoints(&[]).await?;
@@ -1665,19 +1686,23 @@ impl DebugManager {
 
     /// Re-sends what [`suspend_breakpoints`](Self::suspend_breakpoints) / run to cursor replaced.
     pub(crate) async fn restore_breakpoints(&self, session: &Arc<Session>) {
-        let pending = std::mem::take(&mut *session.pending_restore.lock());
+        let pending = {
+            let _update = session.function_breakpoint_update.lock().await;
+            let pending = std::mem::take(&mut *session.pending_restore.lock());
+            if pending.functions || pending.temporary_function.is_some() {
+                let functions = self.function_breakpoints.lock().clone();
+                if let Err(e) = session.send_function_breakpoints(&functions).await {
+                    tracing::debug!("restoring function breakpoints failed: {e}");
+                }
+            }
+            pending
+        };
         let files: Vec<(PathBuf, Vec<Breakpoint>)> =
             pending.files.into_iter().map(|path| (path.clone(), self.stored_breakpoints(&path))).collect();
         let sent = join_all(files.iter().map(|(path, bps)| session.send_breakpoints(path, bps, None))).await;
         for ((path, _), result) in files.iter().zip(sent) {
             if let Err(e) = result {
                 tracing::debug!("restoring breakpoints of {} failed: {e}", path.display());
-            }
-        }
-        if pending.functions {
-            let functions = self.function_breakpoints.lock().clone();
-            if let Err(e) = session.send_function_breakpoints(&functions).await {
-                tracing::debug!("restoring function breakpoints failed: {e}");
             }
         }
         if pending.data {
@@ -1712,6 +1737,39 @@ impl DebugManager {
         session.suspended.resumed(ticket, thread_id, false);
         session.emit(ide_core::event::DebugEvent::Continued { thread_id, all_threads_continued: true });
         Ok(())
+    }
+
+    /// NetCoreDbg has no target-aware stepIn. A temporary method breakpoint plus
+    /// step over stops at the chosen call or at the next sequence point if it is skipped.
+    pub async fn step_into_function(&self, s: DebugSessionId, thread_id: i64, name: String) -> IdeResult<()> {
+        let session = self.session(s)?;
+        if session.adapter != "netcoredbg" || !session.supports("supportsFunctionBreakpoints") {
+            return Err(IdeError::unavailable("The debugger cannot step into a function by name"));
+        }
+        session.check_thread(thread_id)?;
+        let _update = session.function_breakpoint_update.lock().await;
+        if session.pending_restore.lock().temporary_function.is_some() {
+            return Err(IdeError::invalid("A targeted step is already in progress"));
+        }
+        let stored = self.function_breakpoints.lock().clone();
+        let sent = with_temporary_function(&stored, &name);
+        let attempt = async {
+            let states = session.send_function_breakpoints(&sent).await?;
+            if !states.last().is_some_and(|state| state.verified) {
+                return Err(IdeError::unavailable(format!("Cannot resolve the function breakpoint for {name}")));
+            }
+            session.pending_restore.lock().temporary_function = Some(name);
+            self.step(s, thread_id, StepKind::Over).await
+        }
+        .await;
+        if attempt.is_err() {
+            session.pending_restore.lock().temporary_function = None;
+            if let Err(e) = session.send_function_breakpoints(&stored).await {
+                tracing::debug!("restoring function breakpoints failed: {e}");
+                session.pending_restore.lock().functions = true;
+            }
+        }
+        attempt
     }
 
     /// Calls on the current line of `frame_id` that can be stepped into.
@@ -1831,9 +1889,17 @@ impl DebugManager {
             {
                 continue;
             }
-            match s.send_function_breakpoints(&list).await {
-                Ok(states) => {
-                    result.get_or_insert(states);
+            let _update = s.function_breakpoint_update.lock().await;
+            let stored = self.function_breakpoints.lock().clone();
+            let temporary = s.pending_restore.lock().temporary_function.clone();
+            let sent =
+                temporary.as_deref().map_or_else(|| stored.clone(), |name| with_temporary_function(&stored, name));
+            match s.send_function_breakpoints(&sent).await {
+                Ok(mut states) => {
+                    states.truncate(stored.len());
+                    if stored == list {
+                        result.get_or_insert(states);
+                    }
                 }
                 Err(e) => tracing::debug!("setFunctionBreakpoints on session {} failed: {e}", s.id.0),
             }

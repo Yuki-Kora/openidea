@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::path::Path;
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::list_processes;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub enum AttachKind {
@@ -15,6 +20,7 @@ pub enum AttachKind {
     Node,
     Python,
     Go,
+    Dotnet,
     Native,
 }
 
@@ -57,6 +63,7 @@ fn host_port(addr: &str) -> Option<(Option<String>, u16)> {
 pub fn jdwp_address(args: &str) -> Option<(Option<String>, u16)> {
     let opts = args
         .split_whitespace()
+        .map(|arg| arg.trim_matches('"'))
         .find_map(|a| a.strip_prefix("-agentlib:jdwp=").or_else(|| a.strip_prefix("-Xrunjdwp:")))?;
     let mut server = false;
     let mut address = None;
@@ -75,7 +82,7 @@ pub fn jdwp_address(args: &str) -> Option<(Option<String>, u16)> {
 
 /// `--inspect`, `--inspect-brk=9230`, `--inspect=127.0.0.1:9230` (default port 9229).
 fn inspect_address(args: &str) -> Option<(Option<String>, u16)> {
-    args.split_whitespace().find_map(|a| {
+    args.split_whitespace().map(|arg| arg.trim_matches('"')).find_map(|a| {
         let rest = a.strip_prefix("--inspect-brk").or_else(|| a.strip_prefix("--inspect"))?;
         if rest.is_empty() { Some((None, 9229)) } else { host_port(rest.strip_prefix('=')?) }
     })
@@ -83,7 +90,7 @@ fn inspect_address(args: &str) -> Option<(Option<String>, u16)> {
 
 /// `-m debugpy --listen [host:]port`.
 fn debugpy_listen(args: &str) -> Option<(Option<String>, u16)> {
-    let words: Vec<&str> = args.split_whitespace().collect();
+    let words: Vec<&str> = args.split_whitespace().map(|arg| arg.trim_matches('"')).collect();
     if !words.contains(&"debugpy") {
         return None;
     }
@@ -118,15 +125,20 @@ pub fn classify(p: &RawProcess, is_go: impl Fn(&str) -> bool, native_adapter: &s
             port,
         })
     };
-    let base = name.strip_suffix(".exe").unwrap_or(&name);
+    let normalized = if cfg!(windows) { name.to_ascii_lowercase() } else { name.clone() };
+    let base = normalized.strip_suffix(".exe").unwrap_or(&normalized);
     if base == "java" || base == "javaw" {
         // Only JVMs started with a JDWP agent can be attached to.
         return jdwp_address(&p.args).and_then(|a| make(AttachKind::Java, "java-debug", Some(a)));
     }
     if base == "node" || base == "nodejs" {
-        return make(AttachKind::Node, "js-debug", inspect_address(&p.args));
+        let address = inspect_address(&p.args);
+        if cfg!(windows) && address.is_none() {
+            return None;
+        }
+        return make(AttachKind::Node, "js-debug", address);
     }
-    if is_python(&name) {
+    if is_python(&normalized) {
         return make(AttachKind::Python, "debugpy", debugpy_listen(&p.args));
     }
     if is_go(&p.exe) {
@@ -200,7 +212,7 @@ pub fn list_processes() -> IdeResult<Vec<RawProcess>> {
         .collect())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn list_processes() -> IdeResult<Vec<RawProcess>> {
     Err(IdeError::unavailable("Attach to Process is not supported on this platform yet"))
 }
@@ -239,12 +251,19 @@ pub async fn enable_node_inspector(pid: u32) -> IdeResult<u16> {
     Err(IdeError::unavailable(format!("start process {pid} with --inspect to attach to it")))
 }
 
-/// Attachable processes, sorted by kind then name. Blocking (runs `ps`, reads binaries).
+/// Attachable processes, sorted by kind then name. Blocking (enumerates processes and reads binaries).
 pub fn attachable_processes() -> IdeResult<Vec<AttachableProcess>> {
     let cwd = std::env::temp_dir();
     let native = if adapter::resolve_binary("codelldb", &cwd).is_some() { "codelldb" } else { "lldb-dap" };
-    let mut out: Vec<AttachableProcess> =
-        list_processes()?.iter().filter_map(|p| classify(p, is_go_binary, native)).collect();
+    let mut out = Vec::new();
+    for process in list_processes()? {
+        let Some(entry) = classify(&process, is_go_binary, native) else { continue };
+        #[cfg(windows)]
+        if entry.kind == AttachKind::Native && windows::has_coreclr(entry.pid) {
+            out.push(AttachableProcess { kind: AttachKind::Dotnet, adapter: "netcoredbg".into(), ..entry.clone() });
+        }
+        out.push(entry);
+    }
     out.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(out)
 }
@@ -282,7 +301,7 @@ mod tests {
             kind("/usr/local/bin/node", "node --inspect-brk=127.0.0.1:9333 a.js"),
             Some((AttachKind::Node, Some(9333)))
         );
-        assert_eq!(kind("/usr/local/bin/node", "node a.js"), Some((AttachKind::Node, None)));
+        assert_eq!(kind("/usr/local/bin/node", "node a.js"), cfg!(unix).then_some((AttachKind::Node, None)));
         assert_eq!(kind("/usr/bin/python3.12", "python3.12 app.py"), Some((AttachKind::Python, None)));
         assert_eq!(
             kind("/usr/bin/python3", "python3 -m debugpy --listen 5678 --wait-for-client app.py"),
@@ -295,6 +314,44 @@ mod tests {
         assert_eq!(kind("/home/me/gosrv", "./gosrv"), Some((AttachKind::Go, None)));
         assert_eq!(kind("/home/me/a.out", "./a.out"), Some((AttachKind::Native, None)));
         assert!(!is_python("pythonista"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classifies_windows_executables() {
+        assert_eq!(
+            kind(r"C:\Program Files\nodejs\Node.EXE", r#""C:\Program Files\nodejs\Node.EXE" "--inspect=9230" app.js"#),
+            Some((AttachKind::Node, Some(9230)))
+        );
+        assert_eq!(kind(r"C:\Program Files\nodejs\Node.EXE", "node app.js"), None);
+        assert_eq!(
+            kind(r"C:\Tools\PYTHON.EXE", r#"python -m "debugpy" --listen "127.0.0.1:5678" app.py"#),
+            Some((AttachKind::Python, Some(5678)))
+        );
+        assert_eq!(
+            kind(r"C:\Tools\JAVA.EXE", r#"java "-agentlib:jdwp=transport=dt_socket,server=y,address=*:5005" Main"#),
+            Some((AttachKind::Java, Some(5005)))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lists_windows_processes() {
+        let mut child = ide_core::process::prepare(&mut std::process::Command::new("cmd.exe"))
+            .args(["/d", "/q", "/k", "rem openidea-attach-测试"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let list = attachable_processes();
+        let _ = child.kill();
+        let _ = child.wait();
+        let list = list.unwrap();
+        let found = list.iter().find(|p| p.pid == pid).expect("cmd.exe is listed");
+        assert_eq!(found.kind, AttachKind::Native);
+        assert!(found.name.eq_ignore_ascii_case("cmd.exe"));
+        assert!(found.command_line.contains("openidea-attach-测试"));
+        assert!(list.iter().all(|p| p.pid != std::process::id()));
     }
 
     #[test]

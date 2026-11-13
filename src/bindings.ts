@@ -1206,6 +1206,7 @@ export const commands = {
 	/**  Smart Step Into: the calls on the current line of `frame_id`. */
 	debugStepInTargets: (session: DebugSessionId, frameId: number) => typedError<StepInTarget[], IdeError>(__TAURI_INVOKE("debug_step_in_targets", { session, frameId })),
 	debugStepInTarget: (session: DebugSessionId, threadId: number, targetId: number) => typedError<null, IdeError>(__TAURI_INVOKE("debug_step_in_target", { session, threadId, targetId })),
+	debugStepIntoFunction: (session: DebugSessionId, threadId: number, name: string) => typedError<null, IdeError>(__TAURI_INVOKE("debug_step_into_function", { session, threadId, name })),
 	/**  Reset Frame (Drop Frame). */
 	debugRestartFrame: (session: DebugSessionId, frameId: number) => typedError<null, IdeError>(__TAURI_INVOKE("debug_restart_frame", { session, frameId })),
 	debugCapabilities: (session: DebugSessionId) => typedError<DebugCapabilities, IdeError>(__TAURI_INVOKE("debug_capabilities", { session })),
@@ -2505,7 +2506,7 @@ export type AskpassKind =
 /**  Yes / no (an unknown host key); answered with `yes` or `no`. */
 "confirm";
 
-export type AttachKind = "java" | "node" | "python" | "go" | "native";
+export type AttachKind = "java" | "node" | "python" | "go" | "dotnet" | "native";
 
 export type AttachableProcess = {
 	pid: number,

@@ -67,7 +67,7 @@ import { browseFocusedConsoleHistory } from "./ui/expressionHistory";
 import { expressionAt, valueHint } from "./editor/valueTooltip";
 import { mouseEvaluateTarget } from "./editor/quickEvaluate";
 import { showHint } from "@/editor/lsp/hint";
-import { pausedLineTargets, startInlineSmartStep } from "./editor/smartStep";
+import { managedStepTargets, pausedLineTargets, startInlineSmartStep } from "./editor/smartStep";
 import {
   openBreakpointsDialog,
   openConfigChooser,
@@ -142,22 +142,33 @@ async function smartStepInto() {
   const t = pausedTarget();
   if (!t) return;
   const frame = selectedFrame(t.s);
-  if (!frame || !sessionSupports("stepInTargets", t.s)) {
-    await resumeExecution(t.s.id, () => call(commands.debugStep(t.s.id, t.thread, "into")));
+  const stopSeq = useDebug.getState().stopSeq;
+  const adapterTargets = frame != null && sessionSupports("stepInTargets", t.s);
+  const managed =
+    frame && frame === t.s.frames[0] && t.s.adapter === "netcoredbg" && sessionSupports("functionBreakpoints", t.s);
+  const targets = adapterTargets
+    ? pausedLineTargets(await call(commands.debugStepInTargets(t.s.id, frame.id)))
+    : await (managed ? managedStepTargets(frame) : []);
+  const current = pausedTarget();
+  if (
+    !current ||
+    current.s.id !== t.s.id ||
+    current.thread !== t.thread ||
+    selectedFrame(current.s)?.id !== frame?.id ||
+    useDebug.getState().stopSeq !== stopSeq
+  )
+    return;
+  if (targets.length > 1) {
+    if (!startInlineSmartStep(t.s.id, t.thread, targets)) openSmartStepChooser(t.s.id, t.thread, targets, stopSeq);
     return;
   }
-  const targets = pausedLineTargets(await call(commands.debugStepInTargets(t.s.id, frame.id)));
-  if (targets.length <= 1) {
-    await resumeExecution(t.s.id, () =>
-      call(
-        targets[0]
-          ? commands.debugStepInTarget(t.s.id, t.thread, targets[0].id)
-          : commands.debugStep(t.s.id, t.thread, "into"),
-      ),
-    );
-    return;
-  }
-  if (!startInlineSmartStep(t.s.id, t.thread, targets)) openSmartStepChooser(t.s.id, t.thread, targets);
+  await resumeExecution(t.s.id, () =>
+    call(
+      adapterTargets && targets[0]
+        ? commands.debugStepInTarget(t.s.id, t.thread, targets[0].id)
+        : commands.debugStep(t.s.id, t.thread, "into"),
+    ),
+  );
 }
 
 /** Opens the Attach to Process popup and loads the process list. */
@@ -692,7 +703,14 @@ export function registerDebugActions(): () => void {
       },
     },
     step("debug.stepOver", "Step Over", "over", "step-over"),
-    step("debug.stepInto", "Step Into", "into", "step-into"),
+    {
+      id: "debug.stepInto",
+      title: "Step Into",
+      category: "Debug",
+      icon: "step-into",
+      when: paused,
+      run: () => void report(tx("Smart Step Into failed"), smartStepInto()),
+    },
     step("debug.stepOut", "Step Out", "out", "step-out"),
     {
       id: "debug.forceStepOver",

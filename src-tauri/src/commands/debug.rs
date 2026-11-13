@@ -237,6 +237,17 @@ pub async fn debug_step_in_target(
     ide_host::ops::debug::debug_step_in_target(&state.host, "", session, thread_id, target_id).await
 }
 
+#[tauri::command]
+#[specta::specta]
+pub async fn debug_step_into_function(
+    state: State<'_, AppState>,
+    session: DebugSessionId,
+    thread_id: i64,
+    name: String,
+) -> IdeResult<()> {
+    ide_host::ops::debug::debug_step_into_function(&state.host, "", session, thread_id, name).await
+}
+
 /// Reset Frame (Drop Frame).
 #[tauri::command]
 #[specta::specta]

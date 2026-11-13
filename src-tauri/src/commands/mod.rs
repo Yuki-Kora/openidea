@@ -529,6 +529,7 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         debug::debug_force_step_over,
         debug::debug_step_in_targets,
         debug::debug_step_in_target,
+        debug::debug_step_into_function,
         debug::debug_restart_frame,
         debug::debug_capabilities,
         debug::debug_set_function_breakpoints,
